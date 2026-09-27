@@ -136,8 +136,6 @@ captured real-portal markup in `tests/fixtures/`.
 - **Unofficial.** The City of Moncton publishes no API and can change
   the portal at any time. Use a reasonable polling interval (the
   default 4 h is generous; the data updates about daily).
-- Water usage is the portal's data. For real-time leak detection you
-  need local hardware (e.g. a flow meter on the meter's pulse output).
 - Multi-account profiles: the portal's *active* account is used.
 - This project is not affiliated with the City of Moncton.
 
