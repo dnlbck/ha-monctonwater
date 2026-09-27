@@ -1,0 +1,53 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Sign in with your City of Moncton MyAccount credentials (myaccount.moncton.ca). The integration logs in for itself and renews sessions automatically.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "description": "Sign in again with your Moncton MyAccount credentials.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Failed to connect to the Moncton portal. Check your network and try again.",
+      "invalid_auth": "Invalid credentials. Check your username and password and try again."
+    },
+    "abort": {
+      "already_configured": "This Moncton Water account is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "data": {
+          "scan_interval": "Update interval (hours)",
+          "backfill_daily": "Backfill full smart-meter history at hourly resolution (background, runs once)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "water_usage": {
+        "name": "Water usage"
+      },
+      "last_daily_water": {
+        "name": "Last daily water"
+      },
+      "last_billed_water": {
+        "name": "Last billed water"
+      },
+      "daily_average_water": {
+        "name": "Daily average water"
+      }
+    }
+  }
+}

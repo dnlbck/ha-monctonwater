@@ -1,0 +1,156 @@
+"""Parser tests, including against captured real-portal markup."""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+from pathlib import Path
+
+import pytest
+
+from custom_components.monctonwater.api import (
+    BilledReading,
+    DailyReading,
+    is_login_page,
+    parse_account_info,
+    parse_billed_readings,
+    parse_daily_readings,
+    parse_hourly_values,
+)
+from custom_components.monctonwater.exceptions import MonctonWaterApiError
+from custom_components.monctonwater.statistics import (
+    ASSUMED_FIRST_PERIOD_DAYS,
+    billed_spans,
+    daily_points,
+)
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_parse_billed_readings_real_capture():
+    html = (FIXTURES / "consumption_table.html").read_text(encoding="utf-8")
+    readings = parse_billed_readings(html)
+    assert len(readings) == 13
+    assert readings[0].read_date == date(2023, 6, 15)
+    assert readings[-1].read_date == date(2026, 6, 15)
+    # Sorted ascending regardless of the table's newest-first order.
+    assert [r.read_date for r in readings] == sorted(
+        r.read_date for r in readings
+    )
+    # Neutralized capture: every value was the captured one + 1.0.
+    assert readings[-1].consumption_m3 == pytest.approx(69.0)
+    assert readings[0].consumption_m3 == pytest.approx(80.0)
+
+
+def test_parse_daily_readings_real_capture():
+    html = (FIXTURES / "smart_meter_arrays.html").read_text(encoding="utf-8")
+    readings = parse_daily_readings(html)
+    assert len(readings) == 30
+    assert readings[0].day == date(2026, 8, 27)
+    assert readings[-1].day == date(2026, 9, 25)
+    # Neutralized capture: every value was the captured one + 0.001.
+    assert readings[0].consumption_m3 == pytest.approx(0.780)
+    assert readings[-1].consumption_m3 == pytest.approx(0.814)
+    assert all(r.consumption_m3 > 0 for r in readings)
+
+
+def test_parse_daily_readings_empty_page():
+    assert parse_daily_readings("<html><body>no data</body></html>") == []
+
+
+def test_parse_hourly_values_real_capture():
+    html = (FIXTURES / "smart_meter_arrays.html").read_text(encoding="utf-8")
+    # The fixture holds the daily variant: one value per date.
+    values = parse_hourly_values(html)
+    assert len(values) == 30
+
+
+def test_is_login_page():
+    assert is_login_page('<form id="login-form"></form>')
+    assert not is_login_page("<html><body>dashboard</body></html>")
+
+
+def test_parse_account_info_requires_marker():
+    with pytest.raises(MonctonWaterApiError):
+        parse_account_info("<html></html>")
+
+
+def test_parse_account_info_fallback_link():
+    """A fresh-login page without the header still yields the account."""
+    html = (
+        '<html><body><a href="/app/capricorn?para=selectAccount&userAction=select'
+        '&inAccountNumber=123456-789012&inMeterID=123456&meterType=Water">x</a>'
+        "</body></html>"
+    )
+    account = parse_account_info(html)
+    assert account.account_number == "123456-789012"
+    assert account.meter_id == "123456"
+
+
+def test_build_ssl_context_loads_bundled_intermediate():
+    """The context builds and trusts the portal's intermediate CA."""
+    from custom_components.monctonwater.api import build_ssl_context
+
+    context = build_ssl_context()
+    import ssl
+
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.check_hostname is True
+    stats = context.cert_store_stats()
+    # The intermediate adds at least one cert on top of the default store.
+    assert stats["x509_ca"] >= 1
+
+
+def test_parse_hourly_csv():
+    """Rows without an ISO date are skipped; 24 hourly values per day."""
+    from custom_components.monctonwater.api import parse_hourly_csv
+
+    values = [f"{i / 100:.5f}" for i in range(24)]
+    csv_text = (
+        '"Reading Date","1 am CFF Usage",...,"Total CFF Usage"\n'
+        "\n"
+        f'"2026-09-24",{",".join(values)},"0.24000"\n'
+        f'"2026-09-25",{",".join(values)},"0.24000"\n'
+        "\n"
+    )
+    readings = parse_hourly_csv(csv_text)
+    assert [r.day for r in readings] == [date(2026, 9, 24), date(2026, 9, 25)]
+    assert readings[0].values[0] == pytest.approx(0.0)
+    assert readings[0].values[23] == pytest.approx(0.23)
+    assert sum(readings[0].values) == pytest.approx(2.76)
+
+
+def test_billed_spans_chain_periods():
+    readings = [
+        BilledReading(read_date=date(2026, 3, 15), consumption_m3=70.0),
+        BilledReading(read_date=date(2026, 6, 15), consumption_m3=68.0),
+        BilledReading(read_date=date(2026, 9, 16), consumption_m3=65.0),
+    ]
+    spans = billed_spans(readings)
+    # The earliest reading gets an assumed period ending at its read date.
+    assert spans[0][0] == date(2026, 3, 15) - timedelta(
+        days=ASSUMED_FIRST_PERIOD_DAYS - 1
+    )
+    assert spans[0][1] == date(2026, 3, 15)
+    # Later periods start the day after the previous read.
+    assert spans[1][0] == date(2026, 3, 16)
+    assert spans[1][1] == date(2026, 6, 15)
+    assert spans[2][0] == date(2026, 6, 16)
+    # Spans are contiguous and non-overlapping.
+    for (_, end_a, _), (start_b, _, _) in zip(spans, spans[1:]):
+        assert start_b == end_a + timedelta(days=1)
+
+
+def test_daily_points_spreads_and_passes_through():
+    today = date.today()
+    billed = [BilledReading(date(2026, 6, 15), 90.0)]
+    daily = [
+        DailyReading(today - timedelta(days=2), 0.5),
+        DailyReading(today, 0.6),
+    ]
+    points = daily_points(billed, daily, today)
+    by_day = dict(points)
+    # Spread: 90 m³ over the assumed 91-day first period.
+    assert by_day[date(2026, 6, 15)] == pytest.approx(90.0 / 91, abs=1e-6)
+    # Daily rows pass through; today is skipped.
+    assert by_day[today - timedelta(days=2)] == 0.5
+    assert today not in by_day

@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Real API captures and harness output may contain personal data
+scripts/out/
+*.html
+!tests/fixtures/*.html
+
+# Local scratch
+*.log
+.ha_token
