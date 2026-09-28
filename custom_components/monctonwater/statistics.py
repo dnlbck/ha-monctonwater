@@ -34,6 +34,7 @@ import asyncio
 import logging
 from datetime import date, datetime, timedelta
 
+import aiohttp
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
@@ -198,7 +199,7 @@ def _water_statistic_id(hass: HomeAssistant, entry: ConfigEntry) -> str | None:
 async def _fetch_billed(coordinator: MonctonWaterCoordinator) -> list[BilledReading]:
     if coordinator.history_billed:
         return coordinator.history_billed
-    return await coordinator.client.get_billed_readings()
+    return coordinator.merged_billed(await coordinator.client.get_billed_readings())
 
 
 async def async_import_history_statistics(
@@ -281,7 +282,7 @@ async def async_backfill_hourly_statistics(
     for window_from, window_to in _walk_windows(today, floor):
         try:
             batch = await client.get_hourly_csv(window_from, window_to)
-        except (MonctonWaterError, TimeoutError, OSError) as err:
+        except (MonctonWaterError, TimeoutError, OSError, aiohttp.ClientError) as err:
             _LOGGER.warning(
                 "Hourly backfill stopped at %s (%s); it will retry on restart",
                 window_to,
@@ -410,7 +411,7 @@ async def async_import_recent_hourly(
     while day <= last_daily:
         try:
             values = await client.get_hourly_values(day)
-        except (MonctonWaterError, TimeoutError, OSError) as err:
+        except (MonctonWaterError, TimeoutError, OSError, aiohttp.ClientError) as err:
             _LOGGER.warning("Recent hourly import stopped at %s (%s)", day, err)
             break
         if not values:
@@ -421,9 +422,16 @@ async def async_import_recent_hourly(
     if rows:
         async_import_statistics(hass, _metadata(statistic_id), rows)
         await coordinator.store_hourly_progress(day - timedelta(days=1), seed)
-        _LOGGER.debug(
-            "Imported %s recent hourly rows (%s to %s)",
+        _LOGGER.info(
+            "Imported %s recent hourly rows (%s to %s), through advanced to %s",
             len(rows),
             start_day,
             day - timedelta(days=1),
+            day - timedelta(days=1),
+        )
+    else:
+        _LOGGER.warning(
+            "Recent hourly import produced no rows (start %s, last_daily %s)",
+            start_day,
+            last_daily,
         )

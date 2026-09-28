@@ -120,6 +120,9 @@ class MonctonWaterSensorEntity(
             return None
         data = self.coordinator.data or {}
         return {
+            "derived_m3": data.get("derived_m3"),
+            "billed_periods": data.get("billed_periods"),
+            "billed_total_m3": data.get("billed_total_m3"),
             "account_number": data.get("account_number"),
             "meter_id": data.get("meter_id"),
             "service_address": data.get("service_address"),

@@ -422,3 +422,81 @@ async def test_cumulative_sensor_holds_on_downward_revision(
 
     after = float(hass.states.get(water_id).state)
     assert after == before
+
+
+async def test_recent_hourly_followup_imports_new_days(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """After the backfill, a newly published day arrives via the
+    post-refresh listener: the followup re-imports the trailing window
+    and advances the hourly progress."""
+    entry = await _setup_entry(hass, portal, monctonwater_urls)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    coordinator = entry.runtime_data
+    yesterday = date.today() - timedelta(days=1)
+    assert coordinator.stored_hourly_through() == yesterday
+
+    # Simulate the portal publishing a new day after the backfill
+    # completed: rewind the progress one day, then let a normal refresh
+    # trigger the followup listener.
+    await coordinator.store_hourly_progress(
+        yesterday - timedelta(days=1), coordinator.stored_hourly_seed()
+    )
+    await coordinator.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+    assert coordinator.stored_hourly_through() == yesterday
+async def test_rolling_billed_window_preserves_history(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+    monkeypatch,
+):
+    """The portal drops the oldest billed period when a new one bills;
+    the counter must still count the remembered quarter."""
+    import conftest as cf
+
+    entry = await _setup_entry(hass, portal, monctonwater_urls, backfill_daily=False)
+    coordinator = entry.runtime_data
+    entity = _entity_id(hass, entry, WATER_KEY)
+    before = float(hass.states.get(entity).state)
+    billed_total_before = sum(m for _, m in billed_readings())
+
+    # Portal: the oldest period drops off and a newest one (55 m3) bills.
+    rolled = billed_readings()[:-1]
+    rolled.insert(0, (rolled[0][0] + timedelta(days=91), 55.0))
+
+    def patched_page(state):
+        if not state.get("logged_in"):
+            return cf.LOGIN_PAGE
+        rows = [
+            "<tr>"
+            f"<td class='tableColumn_0'>{d.strftime('%b %d, %Y').replace(' 0', ' ')}</td>"
+            f"<td class='tableColumn_1'>{m:.1f}</td>"
+            f"<td>{d.isoformat()}</td></tr>"
+            for d, m in rolled
+        ]
+        return (
+            '<table id="consumptionTable"><thead><tr><th>Date</th>'
+            "<th>Billed Consumption in m³</th><th>Sortable Date</th></tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>"
+        )
+
+    monkeypatch.setattr(cf, "consumption_page", patched_page)
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    after = float(hass.states.get(entity).state)
+    # The remembered oldest quarter still counts: the new total is the
+    # old full history plus the new bill (the buggy behavior held the
+    # counter at `before` instead).
+    assert after == pytest.approx(billed_total_before + 55.0, abs=0.1)
+    assert after > before

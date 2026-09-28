@@ -87,6 +87,12 @@ class MonctonWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._hourly_through: date | None = None
         self._hourly_seed: float | None = None
         self._last_cumulative_m3: float | None = None
+        # The portal's billed table is a rolling window (~13 periods):
+        # when a new quarter bills, the oldest drops off. The counter
+        # and the statistics backfill must work from the full history,
+        # so readings are merged into persisted storage as they appear.
+        self._billed_history: dict[date, float] = {}
+        self._billed_dirty = False
 
     async def async_load_stored(self) -> None:
         """Load backfill progress and the monotonic-counter floor."""
@@ -106,6 +112,28 @@ class MonctonWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._hourly_through = date.fromisoformat(through) if through else None
         self._hourly_seed = raw.get("hourly_seed")
         self._last_cumulative_m3 = raw.get("last_cumulative_m3")
+        self._billed_history = {
+            date.fromisoformat(item[0]): float(item[1])
+            for item in raw.get("billed_history") or []
+        }
+
+    def merged_billed(self, fetched: list[BilledReading]) -> list[BilledReading]:
+        """Merge freshly fetched readings over the persisted history.
+
+        Fetched values win for their dates (the portal may revise);
+        readings the rolling window dropped are retained from storage.
+        Returns the merged list sorted ascending.
+        """
+        changed = False
+        for reading in fetched:
+            if self._billed_history.get(reading.read_date) != reading.consumption_m3:
+                changed = True
+            self._billed_history[reading.read_date] = reading.consumption_m3
+        self._billed_dirty = changed or self._billed_dirty
+        return [
+            BilledReading(read_date=day, consumption_m3=value)
+            for day, value in sorted(self._billed_history.items())
+        ]
 
     async def mark_stats_imported(self) -> None:
         """Persist that the day-resolution statistics import completed."""
@@ -150,6 +178,10 @@ class MonctonWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 ),
                 "hourly_seed": self._hourly_seed,
                 "last_cumulative_m3": self._last_cumulative_m3,
+                "billed_history": [
+                    [day.isoformat(), value]
+                    for day, value in sorted(self._billed_history.items())
+                ],
             }
         )
 
@@ -185,7 +217,7 @@ class MonctonWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         now = dt_util.now()
         today = now.date()
 
-        billed = await self.client.get_billed_readings()
+        billed = self.merged_billed(await self.client.get_billed_readings())
         daily = await self.client.get_daily_readings(
             today - timedelta(days=REFRESH_WINDOW_DAYS), today
         )
@@ -213,8 +245,9 @@ class MonctonWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._last_cumulative_m3 is not None
             else derived_m3
         )
-        if cumulative_m3 != self._last_cumulative_m3:
+        if cumulative_m3 != self._last_cumulative_m3 or self._billed_dirty:
             self._last_cumulative_m3 = cumulative_m3
+            self._billed_dirty = False
             self.hass.async_create_task(self._async_save_stored())
 
         if not self.stats_imported and not self.history_billed:
@@ -235,6 +268,9 @@ class MonctonWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         )
         return {
             "cumulative_m3": cumulative_m3,
+            "derived_m3": derived_m3,
+            "billed_periods": len(billed),
+            "billed_total_m3": round(total - sum(r.consumption_m3 for r in current_period), 3),
             "last_daily_m3": last_daily.consumption_m3 if last_daily else None,
             "last_daily_date": last_daily.day if last_daily else None,
             "last_billed_m3": billed[-1].consumption_m3 if billed else None,

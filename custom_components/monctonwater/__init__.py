@@ -67,6 +67,14 @@ async def async_setup_entry(
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
+    # Keep recent days at hourly resolution. Run inline after the first
+    # refresh (deterministic at every setup) in addition to the
+    # post-refresh listener below; both are idempotent.
+    try:
+        await async_import_recent_hourly(hass, entry, coordinator)
+    except Exception:  # noqa: BLE001
+        _LOGGER.warning("Recent hourly import failed at setup", exc_info=True)
+
     # Phase 1 (immediate): import the fetched history at day resolution. A
     # missing recorder (rare) must not break setup; the import retries on
     # restart.
