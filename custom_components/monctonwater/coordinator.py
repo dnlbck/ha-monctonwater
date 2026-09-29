@@ -221,6 +221,14 @@ class MonctonWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         daily = await self.client.get_daily_readings(
             today - timedelta(days=REFRESH_WINDOW_DAYS), today
         )
+        if billed and not daily:
+            # Observed live: a long-lived portal session can serve the
+            # billed table fine but empty smart-meter arrays. Treat it
+            # as a stale session and let the retry path log in fresh
+            # rather than recording a day with no usage.
+            raise MonctonWaterAuthError(
+                "smart meter page returned no data; re-logging in"
+            )
 
         last_billed_date = billed[-1].read_date if billed else None
 

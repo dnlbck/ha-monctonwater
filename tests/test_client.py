@@ -155,3 +155,35 @@ async def test_hourly_csv_window(client):
     assert sum(readings[10].values) == pytest.approx(
         daily_value(readings[10].day), abs=0.001
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_session_empty_daily_recovered_by_relogin(portal):
+    """A session that serves empty smart-meter arrays recovers on re-login.
+
+    Mirrors the live failure: the billed table kept working while the
+    smart-meter page returned no arrays for the aged session.
+    """
+    async with aiohttp.ClientSession(
+        cookie_jar=aiohttp.CookieJar(unsafe=True)
+    ) as session:
+        client = MonctonWaterClient(session, base_url=server_base(portal))
+        await client.bootstrap(USERNAME, PASSWORD)
+
+        # Age the session: the smart-meter page stops returning data.
+        portal.app["state"]["smart_meter_empty"] = True
+        readings = await client.get_billed_readings()
+        assert readings
+        assert await client.get_daily_readings(
+            date.today() - timedelta(days=10), date.today()
+        ) == []
+
+        # A fresh login clears the portal-side state.
+        client.invalidate()
+        portal.app["state"]["logged_in"] = False
+        portal.app["state"]["smart_meter_empty"] = False
+        await client.ensure_session()
+        readings = await client.get_daily_readings(
+            date.today() - timedelta(days=10), date.today()
+        )
+        assert readings

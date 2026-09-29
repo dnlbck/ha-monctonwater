@@ -271,6 +271,13 @@ def build_app() -> web.Application:
                 return web.Response(
                     text=hourly_page(state, day), content_type="text/html"
                 )
+            if state.get("smart_meter_empty"):
+                # Aged-session behavior: the page renders with no data.
+                empty_before = smart_meter_start() - timedelta(days=200)
+                return web.Response(
+                    text=smart_meter_page(state, empty_before, empty_before),
+                    content_type="text/html",
+                )
             date_from = date.fromisoformat(request.query["fromDate"])
             date_to = date.fromisoformat(request.query["toDate"])
             state["csv_range"] = (date_from, date_to)
