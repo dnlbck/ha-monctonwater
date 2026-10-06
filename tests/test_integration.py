@@ -22,6 +22,7 @@ from conftest import (
     expire_sessions,
     mock_today,
     hourly_values,
+    retention_start,
     server_base,
     smart_meter_start,
 )
@@ -177,13 +178,14 @@ async def test_usage_statistic_backfill(
     enable_custom_integrations,
 ):
     """The backfill builds one cumulative chain in the integration's own
-    statistic: billed periods spread across their days before the smart
-    meter, the meter's hourly readings after, through yesterday."""
+    statistic: hourly readings for the days the portal still keeps, the
+    billed periods spread across their days before that, through
+    yesterday."""
     from custom_components.monctonwater.statistics import ASSUMED_FIRST_PERIOD_DAYS
 
     entry = await _setup_entry(hass, portal, monctonwater_urls)
     rows = await _statistic_rows(hass)
-    start = smart_meter_start()
+    horizon = retention_start()
     yesterday = mock_today() - timedelta(days=1)
 
     # One chain from zero that never decreases, with nothing booked after
@@ -193,23 +195,27 @@ async def test_usage_statistic_backfill(
     assert sums == sorted(sums)
     assert _local(rows[-1]).date() == yesterday
 
-    # The meter era is hourly, each day rendering the meter's reading.
+    # Hourly after the portal's oldest (cut-short) day, each day rendering
+    # the meter's reading.
     changes = _day_changes(rows)
-    era_days = [start + timedelta(days=i) for i in range((yesterday - start).days + 1)]
-    era_rows = [row for row in rows if _local(row).date() >= start]
-    assert len(era_rows) == sum(23 if _is_spring_forward(day) else 24 for day in era_days)
-    for day in era_days:
+    hourly_days = [horizon + timedelta(days=i) for i in range(1, (yesterday - horizon).days + 1)]
+    hourly_rows = [row for row in rows if _local(row).date() > horizon]
+    assert len(hourly_rows) == sum(23 if _is_spring_forward(day) else 24 for day in hourly_days)
+    for day in hourly_days:
         assert changes[day] == pytest.approx(daily_value(day), abs=0.001), day
 
-    # Before it, one midnight row per day: each billed period spread
-    # evenly, adding back up to its bill.
-    assert all(_local(row).hour == 0 for row in rows if _local(row).date() < start)
+    # Up to and including that day: one midnight row per day, each billed
+    # period spread evenly (adding back up to its bill when whole).
+    assert all(_local(row).hour == 0 for row in rows if _local(row).date() <= horizon)
     reads = sorted(billed_readings())
     previous = reads[0][0] - timedelta(days=ASSUMED_FIRST_PERIOD_DAYS)
     for read_date, m3 in reads:
-        if read_date < start:
-            period = [previous + timedelta(days=i + 1) for i in range((read_date - previous).days)]
+        period = [previous + timedelta(days=i + 1) for i in range((read_date - previous).days)]
+        if read_date <= horizon:
             assert sum(changes[day] for day in period) == pytest.approx(m3, abs=0.01)
+        elif period[0] <= horizon:
+            # The cut-short day takes its period's average, not its scrap.
+            assert changes[horizon] == pytest.approx(m3 / len(period), abs=0.001)
         previous = read_date
 
     # The sensor's own statistic is the recorder's alone: nothing imported.

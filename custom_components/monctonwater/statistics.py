@@ -15,7 +15,10 @@ So the history lives in a statistic of its own,
   days (one row per day, at local midnight);
 * the smart-meter era: hourly rows from the portal's CSV export, the
   single source of truth for that era (its hourly and daily numbers
-  agree; the daily page's drift ~2 m³ over two years).
+  agree; the daily page's drift ~2 m³ over two years). The portal keeps
+  two years of meter data, so a backfill reaches back that far; hourly
+  rows imported earlier stay in the statistic after the portal drops
+  them.
 
 Every run reads the statistic's last row back from the recorder and
 continues the chain from it. An empty statistic — first setup, or
@@ -235,6 +238,17 @@ async def _portal_call[_T](
         return await call()
 
 
+def _walk_windows(today: date, floor: date) -> list[tuple[date, date]]:
+    """90-day (from, to) windows from yesterday back to the floor."""
+    windows: list[tuple[date, date]] = []
+    window_to = today - timedelta(days=1)
+    while window_to >= floor:
+        window_from = max(window_to - timedelta(days=QUERY_WINDOW_DAYS - 1), floor)
+        windows.append((window_from, window_to))
+        window_to = window_from - timedelta(days=1)
+    return windows
+
+
 async def _fetch_hourly(
     client: MonctonWaterClient, first: date, last: date
 ) -> list[HourlyReading]:
@@ -317,10 +331,11 @@ async def _backfill(
 ) -> None:
     """Build the chain from scratch (empty statistic).
 
-    ``full`` walks the CSV export from yesterday back to the meter's
-    activation (~12 windows for two years) and spreads the billed periods
-    before it; otherwise the chain starts with the trailing days (or,
-    without smart-meter data, the latest billed period).
+    ``full`` walks the CSV export from yesterday back to the start of
+    the portal's meter data (two years at most: ~9 windows) and spreads
+    the billed periods before it; otherwise the chain starts with the
+    trailing days (or, without smart-meter data, the latest billed
+    period).
     """
     client = coordinator.client
     last_daily: date | None = coordinator.data.get("last_daily_date")
@@ -336,35 +351,29 @@ async def _backfill(
         floor = spans[-1][0] if spans else today
 
     by_day: dict[date, HourlyReading] = {}
-    window_to = today - timedelta(days=1)
-    # Without smart-meter data there is nothing to walk.
-    while last_daily is not None and window_to >= floor:
-        window_from = max(window_to - timedelta(days=QUERY_WINDOW_DAYS - 1), floor)
-        batch = await _portal_call(
-            client,
-            lambda: client.get_hourly_csv(window_from, window_to),  # noqa: B023
-        )
-        if not batch:
-            if not by_day:
-                # The daily page has data, so an empty newest window is a
-                # portal glitch, not an account without a meter.
-                raise MonctonWaterApiError("CSV export served no recent data")
-            break  # the start of the meter era
-        known = min(by_day, default=None)
-        # This window's copy of a day wins: it completes the day the
-        # previous window cut short (below).
-        by_day.update((reading.day, reading) for reading in batch)
-        first = batch[0].day
-        if known is not None and first >= known:
-            break  # nothing older: the start of the meter era
-        # A window served in full continues just before itself. One served
-        # short — the meter's first days or, seen live, only the last ten
-        # days of a window that starts before the meter did, the first of
-        # them cut short — continues with a window ending on its first day,
-        # which brings that day back whole.
-        window_to = window_from - timedelta(days=1) if first == window_from else first
-        await asyncio.sleep(BACKFILL_REQUEST_PAUSE)
+    reached_start = False
+    if last_daily is not None:  # without smart-meter data, nothing to walk
+        for window_from, window_to in _walk_windows(today, floor):
+            batch = await _portal_call(
+                client,
+                lambda: client.get_hourly_csv(window_from, window_to),  # noqa: B023
+            )
+            if not batch:
+                if not by_day:
+                    # The daily page has data, so an empty newest window
+                    # is a portal glitch, not an account without a meter.
+                    raise MonctonWaterApiError("CSV export served no recent data")
+                reached_start = True
+                break
+            by_day.update((reading.day, reading) for reading in batch)
+            await asyncio.sleep(BACKFILL_REQUEST_PAUSE)
     readings = [by_day[day] for day in sorted(by_day)]
+    if reached_start and readings:
+        # The portal keeps two years (730 days) of meter data, rolling by
+        # the hour, so the oldest day it still has is cut short (seen
+        # live: 2024-10-06 held 0.132 of its 0.346 m³) — as is a new
+        # meter's first day. The billed spread covers that day instead.
+        readings = readings[1:]
 
     # Billed spreads cover what the meter does not: up to its first
     # reading, or every period for an account without a smart meter.

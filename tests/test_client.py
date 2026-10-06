@@ -20,8 +20,8 @@ from conftest import (
     daily_value,
     expire_sessions,
     mock_today,
+    retention_start,
     server_base,
-    smart_meter_start,
 )
 from custom_components.monctonwater.api import MonctonWaterClient, portal_today
 from custom_components.monctonwater.exceptions import (
@@ -159,12 +159,11 @@ async def test_billed_readings_parsed(client):
 @pytest.mark.asyncio
 async def test_daily_readings_window_and_era(client):
     today = mock_today()
-    start = smart_meter_start()
     readings = await client.get_daily_readings(
         today - timedelta(days=200), today
     )
-    # Clamped to yesterday, bounded by the meter era.
-    assert readings[0].day == start
+    # Clamped to yesterday, bounded by the portal's horizon.
+    assert readings[0].day == retention_start()
     assert readings[-1].day == today - timedelta(days=1)
     assert readings[10].consumption_m3 == pytest.approx(
         daily_value(readings[10].day)
@@ -216,15 +215,19 @@ async def test_hourly_csv_window(client):
 
 
 @pytest.mark.asyncio
-async def test_hourly_csv_range_starting_before_the_meter(client):
-    """The mock reproduces the portal's quirk (seen live): a range that
-    starts before the meter's first reading gets only its last ten days,
-    the first of them cut short."""
-    start = smart_meter_start()
-    readings = await client.get_hourly_csv(start - timedelta(days=30), start + timedelta(days=40))
-    assert [r.day for r in readings] == [start + timedelta(days=31 + i) for i in range(10)]
-    assert sum(readings[0].values) < daily_value(readings[0].day)
+async def test_portal_keeps_a_rolling_horizon(client):
+    """The mock reproduces the portal's horizon (seen live: 730 days): the
+    oldest day it still has is cut short, older ones are gone, and the
+    daily page agrees with the CSV export."""
+    horizon = retention_start()
+    window = (horizon - timedelta(days=30), horizon + timedelta(days=9))
+    readings = await client.get_hourly_csv(*window)
+    assert [r.day for r in readings] == [horizon + timedelta(days=i) for i in range(10)]
+    assert sum(readings[0].values) < daily_value(horizon)
     assert sum(readings[1].values) == pytest.approx(daily_value(readings[1].day), abs=0.001)
+    daily = await client.get_daily_readings(*window)
+    assert daily[0].day == horizon
+    assert daily[0].consumption_m3 == pytest.approx(sum(readings[0].values), abs=0.001)
 
 
 @pytest.mark.asyncio

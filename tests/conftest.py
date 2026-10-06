@@ -52,11 +52,13 @@ ACCOUNTS = {"testuser": ACCOUNT_NUMBER, "otheruser": OTHER_ACCOUNT_NUMBER}
 METER_ID = "123456"
 SERVICE_ADDRESS = "1 TEST ST, MONCTON, NB E1A 1A1"
 
-# The mock's smart meter reports from this day: 121 days of history, so
-# the backfill's second 90-day window starts before the meter and hits
-# the export's quirk (only that window's last ten days) with older meter
-# days still to fetch.
+# The mock's smart meter reports from this day...
 SMART_METER_START_OFFSET_DAYS = 121
+# ...but like the real portal (730 days, seen live) it only keeps a
+# rolling window of meter data, the oldest day it still has cut short
+# (here: its first 12 hours read 0). The horizon falls inside the meter
+# era, as on the live account.
+RETENTION_DAYS = 110
 
 CSRF_TOKEN = "test-csrf-token-123"
 
@@ -74,6 +76,16 @@ def mock_today() -> date:
 def smart_meter_start(today: date = None) -> date:
     today = today or mock_today()
     return today - timedelta(days=SMART_METER_START_OFFSET_DAYS)
+
+
+def retention_start() -> date:
+    """The oldest day the mock portal still has (cut short)."""
+    return mock_today() - timedelta(days=RETENTION_DAYS)
+
+
+def first_available() -> date:
+    """The oldest day the mock portal serves at all."""
+    return max(smart_meter_start(), retention_start())
 
 
 def daily_value(day: date) -> float:
@@ -102,12 +114,16 @@ def published_hourly(state: dict, day: date) -> list[float]:
     progressively); later hours read 0 until then.
     """
     published = state.get("published_hours", {}).get(day, 24)
-    return [v if hour < published else 0.0 for hour, v in enumerate(hourly_values(day))]
+    first_hour = 12 if day == retention_start() else 0
+    return [
+        v if first_hour <= hour < published else 0.0
+        for hour, v in enumerate(hourly_values(day))
+    ]
 
 
 def published_daily(state: dict, day: date) -> float:
     """The day's daily total as currently published."""
-    if day in state.get("published_hours", {}):
+    if day in state.get("published_hours", {}) or day == retention_start():
         return round(sum(published_hourly(state, day)), 5)
     return daily_value(day)
 
@@ -194,7 +210,7 @@ def smart_meter_page(
     if not state.get("logged_in"):
         return LOGIN_PAGE
     today = mock_today()
-    start = smart_meter_start()
+    start = first_available()
     if date_to is None or date_to >= today:
         date_from = today - timedelta(days=30)
         date_to = today - timedelta(days=1)
@@ -231,7 +247,7 @@ var ajaxURL = "/app/capricorn?para=ajaxDownloadConsumptionData&type=smartmeter&i
 def hourly_page(state: dict, day: date) -> str:
     if not state.get("logged_in"):
         return LOGIN_PAGE
-    if not (smart_meter_start() <= day <= published_until(state)):
+    if not (first_available() <= day <= published_until(state)):
         values_js = ""
     else:
         values = published_hourly(state, day)
@@ -255,25 +271,18 @@ def excel_export_csv(state: dict) -> str:
 
     Mirrors the real export: a header with 24 (mislabelled CFF) hourly
     columns plus a total, a row per day, and padding rows the parser
-    must skip. Also its quirk, seen live: a range that starts before the
-    meter's first reading gets only its last ten days, the first of them
-    cut short (here, its first 12 hours read 0).
+    must skip.
     """
     from_day, to_day = state.get("csv_range", (None, None))
     if from_day is None:
         return ""
     header = ["Reading Date"] + [f"{h} CFF Usage" for h in range(1, 25)] + ["Total CFF Usage"]
     lines = [",".join(f'"{c}"' for c in header), "", ""]
-    cut_short = None
-    if from_day < smart_meter_start():
-        from_day = cut_short = to_day - timedelta(days=9)
-    start = max(from_day, smart_meter_start())
+    start = max(from_day, first_available())
     end = min(to_day, published_until(state))
     day = start
     while day <= end:
         values = published_hourly(state, day)
-        if day == cut_short:
-            values = [0.0] * 12 + values[12:]
         cells = [day.isoformat()] + [f"{v:.5f}" for v in values] + [f"{sum(values):.5f}"]
         lines.append(",".join(cells))
         day += timedelta(days=1)

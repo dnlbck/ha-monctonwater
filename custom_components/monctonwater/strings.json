@@ -39,7 +39,7 @@
   "services": {
     "rebuild_history": {
       "name": "Rebuild usage history",
-      "description": "Clears the Moncton Water usage statistic and imports the history again from the portal. Takes a few minutes."
+      "description": "Clears the Moncton Water usage statistic and imports the history again from the portal, in a few minutes. Days older than the portal's two years of meter data come back as billed averages."
     }
   },
   "entity": {

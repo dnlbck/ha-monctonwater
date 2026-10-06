@@ -21,9 +21,9 @@ traffic in September 2026.
   integration:
   - **~3 years of history**: the billed periods before your smart meter
     (~13 quarters), each spread evenly across its days
-  - **Hourly resolution** for the smart-meter era (back to the meter's
-    activation, September 2024 on the test account), from the portal's
-    CSV export
+  - **Hourly resolution** for the last two years (the portal keeps 730
+    days of meter data), from its CSV export; hourly days stay in the
+    statistic after the portal drops them
   - each refresh appends newly published days and catches up after
     downtime; the latest days are imported again until the portal stops
     revising them
@@ -85,8 +85,10 @@ Today stays empty until the portal publishes it, the next day.
 
 ### Data resolution
 
-- From the smart meter's activation on: hourly, as the meter recorded it.
-- Before it, from the billed table (~13 quarterly periods, ~3 years;
+- The last two years: hourly, as the meter recorded it. The portal keeps
+  730 days of meter data, so that is how far a first import reaches;
+  days stay hourly in the statistic after the portal drops them.
+- Before that, from the billed table (~13 quarterly periods, ~3 years;
   the integration keeps quarters that later drop off the table): each
   period spread evenly across its days, so quarter and year views total
   exactly while daily views of those quarters are estimates.
@@ -103,7 +105,9 @@ changed via **Configure** on the integration entry.
 
 Run the **Moncton Water: Rebuild usage history** action (Developer
 tools → Actions, `monctonwater.rebuild_history`): it clears the usage
-statistic and imports it again from the portal, in a few minutes.
+statistic and imports it again from the portal, in a few minutes. Days
+older than the portal's two years of meter data come back as billed
+averages, so rebuild only when needed.
 
 ### Upgrading from 0.3
 
