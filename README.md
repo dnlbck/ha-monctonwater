@@ -16,36 +16,36 @@ traffic in September 2026.
 ## Features
 
 - Username/password sign-in with automatic session renewal
-- **Energy dashboard ready**: a cumulative `total_increasing` water
-  sensor (m³) derived from the portal's own books — all billed periods
-  plus the current period's daily readings
-- **~3 years of history backfill**: on first setup, every billed period
-  (~13 quarters) is imported as long-term statistics — each period's m³
-  spread evenly across its days
-- **Smart-meter upgrade**: a background task then re-fetches the meter's
-  full daily history (back to its activation, September 2024 on the
-  test account) in 90-day windows and replaces the spread estimates
-  with real daily readings — about ten requests, runs once
-- **Hourly resolution**: a second background walk pulls the portal's CSV
-  export (hourly values per day) in 90-day windows and upgrades the
-  whole smart-meter era to hourly rows; each refresh keeps new days
-  hourly. Imported statistics use cumulative sums — the convention the
-  Energy dashboard's rendering requires — so consumption never renders
-  negative
+- **Energy dashboard ready**: a water usage statistic, *Moncton Water
+  usage (your account number)*, built and kept current by the
+  integration:
+  - **~3 years of history**: the billed periods before your smart meter
+    (~13 quarters), each spread evenly across its days
+  - **Hourly resolution** for the smart-meter era (back to the meter's
+    activation, September 2024 on the test account), from the portal's
+    CSV export
+  - each refresh appends newly published days and catches up after
+    downtime; the latest days are imported again until the portal stops
+    revising them
+- A cumulative `total_increasing` water sensor (m³) — all billed periods
+  plus the current period's daily readings — for automations and history
 - Latest daily usage, latest billed amount, trailing-window daily
   average; account/meter/address attributes
 
+Usage arrives a day late: the portal publishes yesterday within 24
+hours, sometimes in stages. That is why the history lives in a statistic
+of its own rather than the sensor's — Home Assistant builds a sensor's
+statistics from its live state, so it would book each day in one lump
+when the portal publishes it.
+
 Each refresh reads one page, the smart meter's daily window; the billed
-table, which only changes quarterly, is re-read once a day. Daily
-readings publish once per day — yesterday's usage appears within 24
-hours, sometimes in stages, and recent days are re-imported when the
-portal revises them.
+table, which only changes quarterly, is re-read once a day.
 
 ## Entities
 
 | Entity | Class | Description |
 |---|---|---|
-| `sensor.moncton_water_water_usage` | water (m³, total increasing) | **Use this one in the Energy dashboard.** Cumulative counter derived from billed periods + daily readings. |
+| `sensor.moncton_water_water_usage` | water (m³, total increasing) | Cumulative counter derived from billed periods + daily readings. |
 | `sensor.moncton_water_last_daily_water` | water (m³) | Most recent daily consumption |
 | `sensor.moncton_water_last_billed_water` | water (m³) | Most recent billed period's consumption |
 | `sensor.moncton_water_daily_average_water` | water (m³) | Average per day over the fetched window |
@@ -73,32 +73,50 @@ directory of your Home Assistant configuration and restart.
 
 1. **Settings → Devices & Services → Add Integration → Moncton Water**
 2. Enter your Moncton MyAccount username and password
-3. First setup imports the billed history as statistics; the
-   smart-meter daily upgrade then runs in the background (a few
-   minutes)
+3. The usage history imports in the background (a few minutes)
 
 ### Adding to the Energy dashboard
 
 1. **Settings → Dashboards → Energy**
 2. Under **Water consumption**, click **Add consumption**
-3. Select **Moncton Water Water usage**
+3. Select **Moncton Water usage (*your account number*)**
 
-### Data resolution & freshness
+Today stays empty until the portal publishes it, the next day.
 
-- Daily smart-meter data is published once per day; yesterday's usage
-  appears within 24 hours.
-- The billed table carries ~13 quarterly periods (~3 years). Before the
-  meter's activation (September 2024 on the test account) those periods
-  are imported as evenly-spread daily averages — daily views for those
-  quarters are estimates, while quarter/year views total exactly. From
-  the activation date on, the Energy dashboard shows real daily values,
-  and after the hourly backfill completes, real hourly values.
+### Data resolution
+
+- From the smart meter's activation on: hourly, as the meter recorded it.
+- Before it, from the billed table (~13 quarterly periods, ~3 years;
+  the integration keeps quarters that later drop off the table): each
+  period spread evenly across its days, so quarter and year views total
+  exactly while daily views of those quarters are estimates.
+- Accounts without smart-meter data get the billed periods only, the
+  statistic growing as each new period bills.
 
 ### Options
 
-The polling interval (1–24 hours, default 4) and the one-time
-hourly-resolution backfill (on by default) can be changed via
-**Configure** on the integration entry.
+The polling interval (1–24 hours, default 4) and the history backfill
+(on by default; off starts the statistic with the last few days) can be
+changed via **Configure** on the integration entry.
+
+### Starting the history over
+
+Run the **Moncton Water: Rebuild usage history** action (Developer
+tools → Actions, `monctonwater.rebuild_history`): it clears the usage
+statistic and imports it again from the portal, in a few minutes.
+
+### Upgrading from 0.3
+
+Earlier versions imported the history into the water sensor's own
+statistic, where it could not line up with the sensor's live data (the
+Energy dashboard's *today* showed usage that had not happened yet).
+From 0.4 the history goes to the separate statistic instead:
+
+1. In the Energy dashboard, replace the water source **Moncton Water
+   Water usage** with **Moncton Water usage (*your account number*)**.
+   The sensor keeps working, but its statistic no longer gets history.
+2. The sensor's statistic keeps what 0.3 imported. Nothing reads it once
+   the Energy dashboard is switched, so it can stay.
 
 ## Verifying the API before installing
 

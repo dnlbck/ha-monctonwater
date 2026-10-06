@@ -11,8 +11,8 @@ BASE_URL = "https://myaccount.moncton.ca"
 CONF_SCAN_INTERVAL = "scan_interval"
 CONF_BACKFILL_DAILY = "backfill_daily"
 
-# How many trailing days the per-refresh hourly continuation re-imports
-# (heals the recorder's lumpy native rows and any compaction rewrites).
+# Trailing days (before the latest) the usage statistic imports again
+# while the portal may still revise them: yesterday publishes in stages.
 REIMPORT_DAYS = 2
 
 # Smart meter readings publish once per day (yesterday's usage appears
@@ -34,8 +34,3 @@ BACKFILL_REQUEST_PAUSE = 2.0
 
 STORAGE_KEY = "monctonwater"
 STORAGE_VERSION = 1
-
-# Bump to force one clean re-import of all statistics after changes to
-# the import convention (v0.1 wrote per-period sums; the dashboard
-# renders cumulative sums).
-STATS_GEN = 5

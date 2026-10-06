@@ -9,7 +9,6 @@ import pytest
 
 from custom_components.monctonwater.api import (
     BilledReading,
-    DailyReading,
     is_login_page,
     parse_account_info,
     parse_billed_readings,
@@ -20,7 +19,7 @@ from custom_components.monctonwater.exceptions import MonctonWaterApiError
 from custom_components.monctonwater.statistics import (
     ASSUMED_FIRST_PERIOD_DAYS,
     billed_spans,
-    daily_points,
+    spread_days,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -180,17 +179,20 @@ def test_billed_spans_chain_periods():
         assert start_b == end_a + timedelta(days=1)
 
 
-def test_daily_points_spreads_and_passes_through():
-    today = date.today()
-    billed = [BilledReading(date(2026, 6, 15), 90.0)]
-    daily = [
-        DailyReading(today - timedelta(days=2), 0.5),
-        DailyReading(today, 0.6),
-    ]
-    points = daily_points(billed, daily, today)
-    by_day = dict(points)
-    # Spread: 90 m³ over the assumed 91-day first period.
-    assert by_day[date(2026, 6, 15)] == pytest.approx(90.0 / 91, abs=1e-6)
-    # Daily rows pass through; today is skipped.
-    assert by_day[today - timedelta(days=2)] == 0.5
-    assert today not in by_day
+def test_spread_days_covers_spans_evenly():
+    spans = billed_spans(
+        [
+            BilledReading(read_date=date(2026, 3, 15), consumption_m3=70.0),
+            BilledReading(read_date=date(2026, 6, 15), consumption_m3=92.0),
+        ]
+    )
+    by_day = dict(spread_days(spans, date(2026, 3, 10), date(2026, 3, 20)))
+    assert min(by_day) == date(2026, 3, 10)
+    assert max(by_day) == date(2026, 3, 20)
+    # 70 m3 over the assumed 91-day first period; 92 m3 over Mar 16-Jun 15.
+    assert by_day[date(2026, 3, 15)] == pytest.approx(70.0 / 91)
+    assert by_day[date(2026, 3, 16)] == pytest.approx(92.0 / 92)
+    # Whole periods add back up to their bills; days no span covers are skipped.
+    year = spread_days(spans, date(2025, 1, 1), date(2026, 12, 31))
+    assert sum(m3 for _, m3 in year) == pytest.approx(162.0)
+    assert len(year) == 91 + 92

@@ -4,36 +4,47 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable
 from datetime import timedelta
-from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import ConfigEntryAuthFailed
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.aiohttp_client import async_create_clientsession
+from homeassistant.helpers.typing import ConfigType
 
 from .api import MonctonWaterClient, build_ssl_context
 from .const import (
     BASE_URL,
-    CONF_BACKFILL_DAILY,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
 )
 from .coordinator import MonctonWaterCoordinator
-from .statistics import (
-    async_backfill_hourly_statistics,
-    async_import_history_statistics,
-    async_import_recent_hourly,
-)
+from .statistics import async_rebuild_usage_statistic, async_update_usage_statistic
 
 PLATFORMS: list[str] = ["sensor"]
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
+
+SERVICE_REBUILD_HISTORY = "rebuild_history"
 
 type MonctonWaterConfigEntry = ConfigEntry[MonctonWaterCoordinator]
 
 _LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
+    """Register the integration's actions."""
+
+    async def _rebuild_history(call: ServiceCall) -> None:
+        for entry in hass.config_entries.async_loaded_entries(DOMAIN):
+            await async_rebuild_usage_statistic(hass, entry, entry.runtime_data)
+
+    hass.services.async_register(DOMAIN, SERVICE_REBUILD_HISTORY, _rebuild_history)
+    return True
 
 
 async def async_setup_entry(
@@ -72,47 +83,17 @@ async def async_setup_entry(
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Phase 1 (immediate): import the fetched history at day resolution. A
-    # missing recorder (rare) must not break setup; the import retries on
-    # restart.
-    try:
-        await async_import_history_statistics(hass, entry, coordinator)
-    except Exception:  # noqa: BLE001
-        _LOGGER.warning("Statistics backfill failed; will retry on restart", exc_info=True)
-
-    # Keep recent days at hourly resolution: once now (deterministic at
-    # every setup) and after each refresh. It is a no-op until the hourly
-    # backfill has completed, and idempotent after.
-    followup = _make_hourly_followup(hass, entry, coordinator)
-    followup()
-    entry.async_on_unload(coordinator.async_add_listener(followup))
-
-    # Background backfill: rebuild the statistics series at hourly
-    # resolution from the portal's CSV export (one continuous chain that
-    # ends at 0 where the recorder's native rows begin). The client
+    # Keep the usage statistic current: once now (it backfills an empty
+    # statistic) and after each refresh. Each run is a background task —
+    # it neither delays startup nor outlives the entry — and the client
     # serializes portal requests, so the CSV export's "last queried
-    # range" cannot be changed under it. A background task neither
-    # delays startup nor outlives the entry.
-    if entry.options.get(CONF_BACKFILL_DAILY, True):
-        entry.async_create_background_task(
-            hass,
-            _logged(
-                async_backfill_hourly_statistics(hass, entry, coordinator),
-                "Hourly backfill",
-            ),
-            f"{DOMAIN}_backfill_{entry.entry_id}",
-        )
+    # range" cannot change under a run.
+    update_statistic = _make_statistic_updater(hass, entry, coordinator)
+    update_statistic()
+    entry.async_on_unload(coordinator.async_add_listener(update_statistic))
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
-
-
-async def _logged(job: Coroutine[Any, Any, None], what: str) -> None:
-    """Await a background job, logging (not raising) any failure."""
-    try:
-        await job
-    except Exception:  # noqa: BLE001
-        _LOGGER.warning("%s failed", what, exc_info=True)
 
 
 async def async_unload_entry(
@@ -129,23 +110,24 @@ async def _async_update_listener(
     await hass.config_entries.async_reload(entry.entry_id)
 
 
-def _make_hourly_followup(
+def _make_statistic_updater(
     hass: HomeAssistant, entry: MonctonWaterConfigEntry, coordinator: MonctonWaterCoordinator
 ) -> Callable[[], None]:
-    """Build the post-refresh callback that keeps new days hourly."""
+    """Build the callback that updates the usage statistic, one run at a time."""
     task: asyncio.Task[None] | None = None
 
-    def _followup() -> None:
+    async def _run() -> None:
+        try:
+            await async_update_usage_statistic(hass, entry, coordinator)
+        except Exception:  # noqa: BLE001
+            _LOGGER.warning("Usage statistic update failed", exc_info=True)
+
+    def _update() -> None:
         nonlocal task
         if task is not None and not task.done():
             return  # the previous run is still talking to the portal
         task = entry.async_create_background_task(
-            hass,
-            _logged(
-                async_import_recent_hourly(hass, entry, coordinator),
-                "Recent hourly import",
-            ),
-            f"{DOMAIN}_hourly_followup_{entry.entry_id}",
+            hass, _run(), f"{DOMAIN}_usage_statistic_{entry.entry_id}"
         )
 
-    return _followup
+    return _update

@@ -31,9 +31,15 @@
       "init": {
         "data": {
           "scan_interval": "Update interval (hours)",
-          "backfill_daily": "Backfill full smart-meter history at hourly resolution (background, runs once)"
+          "backfill_daily": "Backfill the usage statistic with the full history (background, whenever the statistic is empty)"
         }
       }
+    }
+  },
+  "services": {
+    "rebuild_history": {
+      "name": "Rebuild usage history",
+      "description": "Clears the Moncton Water usage statistic and imports the history again from the portal. Takes a few minutes."
     }
   },
   "entity": {

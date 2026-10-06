@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -16,12 +17,11 @@ from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
-from .api import BilledReading, DailyReading, MonctonWaterClient
+from .api import BilledReading, MonctonWaterClient
 from .const import (
     DEFAULT_SCAN_INTERVAL,
     DOMAIN,
     MIN_SCAN_INTERVAL,
-    STATS_GEN,
     STORAGE_KEY,
     STORAGE_VERSION,
 )
@@ -91,19 +91,12 @@ class MonctonWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._store = Store[dict[str, Any]](
             hass, STORAGE_VERSION, f"{STORAGE_KEY}.{entry.entry_id}"
         )
-        # Rows captured on the first refresh, consumed by the one-time
-        # statistics import once the entities are registered.
-        self.history_billed: list[BilledReading] = []
-        self.history_daily: list[DailyReading] = []
-        self.stats_imported = False
-        self.backfill_complete = False
-        self.hourly_complete = False
-        self._hourly_through: date | None = None
-        self._hourly_seed: float | None = None
-        # Daily totals of the trailing window at the last hourly import:
-        # the portal publishes yesterday progressively, so a changed total
-        # means the day's hours need importing again.
-        self._hourly_totals: dict[str, float | None] | None = None
+        # Daily totals of the trailing window at the last usage-statistic
+        # import: the portal publishes yesterday progressively, so a
+        # changed total means the days need importing again.
+        self._import_totals: dict[str, float | None] | None = None
+        # Serializes usage-statistic runs (background updates, rebuilds).
+        self.statistic_lock = asyncio.Lock()
         self._last_cumulative_m3: float | None = None
         self._warned_no_daily = False
         # The portal's billed table is a rolling window (~13 periods):
@@ -115,28 +108,13 @@ class MonctonWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._billed_checked: datetime | None = None
 
     async def async_load_stored(self) -> None:
-        """Load backfill progress and the monotonic-counter floor."""
+        """Load the monotonic-counter floor and the billed history.
+
+        Keys older versions stored (backfill flags, hourly seeds) are
+        ignored: the usage statistic now keeps its own progress.
+        """
         raw = await self._store.async_load() or {}
-        if raw and raw.get("stats_gen") != STATS_GEN:
-            # v0.1 wrote per-period amounts into the statistics sum
-            # column; the dashboard renders sum deltas, so those rows
-            # must be re-imported with cumulative sums. The cumulative
-            # counter's floor survives the reset — losing it would let
-            # the sensor dip and book a negative — and so does the
-            # billed history: quarters the portal's rolling window has
-            # dropped cannot be fetched again.
-            _LOGGER.info("Resetting backfill progress to repair statistics convention")
-            raw = {
-                "last_cumulative_m3": raw.get("last_cumulative_m3"),
-                "billed_history": raw.get("billed_history"),
-            }
-        self.stats_imported = bool(raw.get("stats_imported"))
-        self.backfill_complete = bool(raw.get("backfill_complete"))
-        self.hourly_complete = bool(raw.get("hourly_complete"))
-        through = raw.get("hourly_through")
-        self._hourly_through = date.fromisoformat(through) if through else None
-        self._hourly_seed = raw.get("hourly_seed")
-        self._hourly_totals = raw.get("hourly_totals")
+        self._import_totals = raw.get("import_totals")
         self._last_cumulative_m3 = raw.get("last_cumulative_m3")
         self._billed_history = {
             date.fromisoformat(item[0]): float(item[1])
@@ -174,63 +152,22 @@ class MonctonWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             for day, value in sorted(self._billed_history.items())
         ]
 
-    async def mark_stats_imported(self) -> None:
-        """Persist that the day-resolution statistics import completed."""
-        self.stats_imported = True
-        await self._async_save_stored()
+    async def store_import_totals(self, totals: dict[str, float | None] | None) -> None:
+        """Persist the daily totals the last statistic import settled on.
 
-    async def mark_backfill_complete(self) -> None:
-        """Persist that the daily-resolution upgrade backfill completed."""
-        self.backfill_complete = True
-        await self._async_save_stored()
-
-    async def mark_hourly_complete(self) -> None:
-        """Persist that the hourly backfill completed."""
-        self.hourly_complete = True
-        await self._async_save_stored()
-
-    async def store_hourly_progress(
-        self,
-        through: date,
-        seed: float,
-        totals: dict[str, float | None] | None = None,
-    ) -> None:
-        """Persist the hourly import's resume point and running total.
-
-        ``totals`` are the daily totals the import was based on; None
-        makes the next refresh import the trailing window again.
+        None makes the next refresh import the trailing window again.
         """
-        self._hourly_through = through
-        self._hourly_seed = seed
-        self._hourly_totals = totals
+        self._import_totals = totals
         await self._async_save_stored()
 
-    def stored_hourly_through(self) -> date | None:
-        """Return the last day imported at hourly resolution."""
-        return self._hourly_through
-
-    def stored_hourly_seed(self) -> float | None:
-        """Return the running total through the last hourly-imported day."""
-        return self._hourly_seed
-
-    def stored_hourly_totals(self) -> dict[str, float | None] | None:
-        """Return the daily totals the last hourly import was based on."""
-        return self._hourly_totals
+    def stored_import_totals(self) -> dict[str, float | None] | None:
+        """Return the daily totals the last statistic import settled on."""
+        return self._import_totals
 
     async def _async_save_stored(self) -> None:
         await self._store.async_save(
             {
-                "stats_gen": STATS_GEN,
-                "stats_imported": self.stats_imported,
-                "backfill_complete": self.backfill_complete,
-                "hourly_complete": self.hourly_complete,
-                "hourly_through": (
-                    self._hourly_through.isoformat()
-                    if self._hourly_through
-                    else None
-                ),
-                "hourly_seed": self._hourly_seed,
-                "hourly_totals": self._hourly_totals,
+                "import_totals": self._import_totals,
                 "last_cumulative_m3": self._last_cumulative_m3,
                 "billed_history": [
                     [day.isoformat(), value]
@@ -331,14 +268,6 @@ class MonctonWaterCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             self._last_cumulative_m3 = cumulative_m3
             self._billed_dirty = False
             self.hass.async_create_task(self._async_save_stored())
-
-        if not self.stats_imported and not self.history_billed:
-            self.history_billed = billed
-            # The full fetched window (real readings override the spread
-            # of overlapping billing periods) — not just the current
-            # period, so the phase-1 series totals the same amount the
-            # later backfill phases will.
-            self.history_daily = daily
 
         last_daily = daily[-1] if daily else None
         daily_average = (

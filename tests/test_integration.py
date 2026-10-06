@@ -1,8 +1,8 @@
-"""Home Assistant-level tests: setup, sensors, config flow, statistics backfill."""
+"""Home Assistant-level tests: setup, sensors, config flow, usage statistic."""
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
@@ -41,37 +41,6 @@ def _expected_sensor_cumulative() -> float:
     today = mock_today()
     total = sum(m3 for _, m3 in billed)
     day = max(smart_meter_start(), last_read + timedelta(days=1))
-    while day <= today - timedelta(days=1):
-        total += daily_value(day)
-        day += timedelta(days=1)
-    return round(total, 3)
-
-
-def _expected_cumulative() -> float:
-    """Spread total with the fetched window's days replaced by real readings."""
-    billed = billed_readings()
-    today = mock_today()
-    window_from = max(smart_meter_start(), today - timedelta(days=100))
-    total = 0.0
-    for i, (read, m3) in enumerate(billed):
-        prev = (
-            billed[i + 1][0]
-            if i + 1 < len(billed)
-            else read - timedelta(days=91)  # ASSUMED_FIRST_PERIOD_DAYS
-        )
-        # The span is (prev read + 1 .. read) — (read - prev).days days.
-        span_days = (read - prev).days
-        day = prev + timedelta(days=1)
-        while day <= read:
-            if window_from <= day <= today - timedelta(days=1):
-                total += daily_value(day)
-            else:
-                total += m3 / span_days
-            day += timedelta(days=1)
-    # Days after the last read belong to no span; the real readings
-    # cover them.
-    last_read = billed[0][0]
-    day = max(window_from, last_read + timedelta(days=1))
     while day <= today - timedelta(days=1):
         total += daily_value(day)
         day += timedelta(days=1)
@@ -154,148 +123,265 @@ async def test_water_sensor_derives_from_billed_plus_daily(
     assert float(water.state) == pytest.approx(_expected_sensor_cumulative(), abs=0.05)
 
 
-async def test_history_statistics_imported(
-    recorder_mock,
-    hass,
-    portal,
-    monctonwater_urls,
-    patched_helper_session,
-    enable_custom_integrations,
-):
-    """Phase 1: day-resolution import with cumulative sums (the
-    dashboard renders sum deltas, so sum must be a running total)."""
+STATISTIC_ID = f"{DOMAIN}:water_usage_{ACCOUNT_NUMBER.replace('-', '_')}"
+
+
+async def _statistic_rows(
+    hass: HomeAssistant, statistic_id: str = STATISTIC_ID
+) -> list[dict]:
+    """Every hourly-table row of a statistic, oldest first."""
     from homeassistant.components.recorder import get_instance
     from homeassistant.components.recorder.statistics import statistics_during_period
 
-    entry = await _setup_entry(hass, portal, monctonwater_urls, backfill_daily=False)
     await get_instance(hass).async_block_till_done()
-
-    statistic_id = _entity_id(hass, entry, WATER_KEY)
     stats = await get_instance(hass).async_add_executor_job(
         statistics_during_period,
         hass,
         dt_util.utc_from_timestamp(0),
         dt_util.now(),
-        (statistic_id,),
-        "hour",
-        None,
-        {"state", "sum", "change"},
-    )
-    rows = sorted(stats[statistic_id], key=lambda r: r["start"])
-    # Billed spans spread (~8 quarters) plus the daily window after the
-    # last read; every row is a day at local midnight.
-    assert len(rows) > 700
-    assert all(
-        dt_util.as_local(dt_util.utc_from_timestamp(r["start"])).hour == 0
-        for r in rows
-    )
-    # sum and state are running totals through the END of each day, so
-    # every rendered change (sum delta) is the day's consumption. The
-    # series is re-anchored to end at 0 (matching the native series'
-    # zero anchor), so old sums are negative — only deltas matter.
-    sums = [r["sum"] for r in rows if r["sum"] is not None]
-    states = [r["state"] for r in rows if r["state"] is not None]
-    assert sums == sorted(sums), "sum series decreased"
-    assert states == sorted(states), "state series decreased"
-    assert rows[0]["sum"] == pytest.approx(rows[0]["state"])
-    changes = [
-        rows[i]["sum"] - rows[i - 1]["sum"] for i in range(1, len(rows))
-    ]
-    assert all(c >= -0.001 for c in changes), "negative rendered consumption"
-    # The series is re-anchored to end at ~0 (native rows may follow with
-    # small positive sums); its head sits at roughly minus the total.
-    assert rows[-1]["sum"] == pytest.approx(0.0, abs=1.0)
-    assert rows[0]["sum"] == pytest.approx(-_expected_cumulative(), abs=1.5)
-
-
-async def test_hourly_backfill_upgrades_resolution(
-    recorder_mock,
-    hass,
-    portal,
-    monctonwater_urls,
-    patched_helper_session,
-    enable_custom_integrations,
-):
-    """The CSV backfill rebuilds the whole series at hourly resolution,
-    ending at exactly 0 where the recorder's native rows begin."""
-    from homeassistant.components.recorder import get_instance
-    from homeassistant.components.recorder.statistics import statistics_during_period
-
-    from conftest import hourly_values
-
-    entry = await _setup_entry(hass, portal, monctonwater_urls)
-    await hass.async_block_till_done(wait_background_tasks=True)
-    await get_instance(hass).async_block_till_done()
-
-    statistic_id = _entity_id(hass, entry, WATER_KEY)
-    stats = await get_instance(hass).async_add_executor_job(
-        statistics_during_period,
-        hass,
-        dt_util.utc_from_timestamp(0),
-        dt_util.now(),
-        (statistic_id,),
+        {statistic_id},
         "hour",
         None,
         {"state", "sum"},
     )
-    rows = sorted(stats[statistic_id], key=lambda r: r["start"])
+    return sorted(stats.get(statistic_id, []), key=lambda row: row["start"])
 
-    def _seconds(raw: float) -> int:
-        return round(raw / 1000) if raw > 1e11 else round(raw)
 
-    by_start = {_seconds(r["start"]): r["sum"] for r in rows}
+def _local(row: dict) -> datetime:
+    return dt_util.as_local(dt_util.utc_from_timestamp(row["start"]))
 
-    hourly_rows = [
-        r for r in rows if dt_util.as_local(dt_util.utc_from_timestamp(r["start"])).hour != 0
-    ]
-    assert hourly_rows, "expected hourly (non-midnight) statistic rows"
+
+def _day_changes(rows: list[dict]) -> dict[date, float]:
+    """Each local day's rendered consumption: its rows' sum deltas."""
+    changes: dict[date, float] = {}
+    previous = 0.0
+    for row in rows:
+        day = _local(row).date()
+        changes[day] = changes.get(day, 0.0) + row["sum"] - previous
+        previous = row["sum"]
+    return changes
+
+
+async def _refresh(hass: HomeAssistant, entry: MockConfigEntry) -> None:
+    """Refresh, then let the usage-statistic update finish."""
+    await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+
+
+async def test_usage_statistic_backfill(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """The backfill builds one cumulative chain in the integration's own
+    statistic: billed periods spread across their days before the smart
+    meter, the meter's hourly readings after, through yesterday."""
+    from custom_components.monctonwater.statistics import ASSUMED_FIRST_PERIOD_DAYS
+
+    entry = await _setup_entry(hass, portal, monctonwater_urls)
+    rows = await _statistic_rows(hass)
     start = smart_meter_start()
     yesterday = mock_today() - timedelta(days=1)
-    # 23 rows after midnight per day of the meter era (hour 0 shares
-    # midnight with the day row) — one fewer on a spring-forward day,
-    # whose 02:00 does not exist on the wall clock.
+
+    # One chain from zero that never decreases, with nothing booked after
+    # yesterday: today renders nothing until the portal publishes it.
+    sums = [row["sum"] for row in rows]
+    assert sums[0] > 0
+    assert sums == sorted(sums)
+    assert _local(rows[-1]).date() == yesterday
+
+    # The meter era is hourly, each day rendering the meter's reading.
+    changes = _day_changes(rows)
     era_days = [start + timedelta(days=i) for i in range((yesterday - start).days + 1)]
-    assert len(hourly_rows) == sum(
-        22 if _is_spring_forward(day) else 23 for day in era_days
+    era_rows = [row for row in rows if _local(row).date() >= start]
+    assert len(era_rows) == sum(23 if _is_spring_forward(day) else 24 for day in era_days)
+    for day in era_days:
+        assert changes[day] == pytest.approx(daily_value(day), abs=0.001), day
+
+    # Before it, one midnight row per day: each billed period spread
+    # evenly, adding back up to its bill.
+    assert all(_local(row).hour == 0 for row in rows if _local(row).date() < start)
+    reads = sorted(billed_readings())
+    previous = reads[0][0] - timedelta(days=ASSUMED_FIRST_PERIOD_DAYS)
+    for read_date, m3 in reads:
+        if read_date < start:
+            period = [previous + timedelta(days=i + 1) for i in range((read_date - previous).days)]
+            assert sum(changes[day] for day in period) == pytest.approx(m3, abs=0.01)
+        previous = read_date
+
+    # The sensor's own statistic is the recorder's alone: nothing imported.
+    assert await _statistic_rows(hass, _entity_id(hass, entry, WATER_KEY)) == []
+
+
+@pytest.mark.parametrize("gap_days", [1, 10])
+async def test_usage_statistic_appends_new_days(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+    gap_days,
+):
+    """Newly published days extend the chain: the next day, or a run of
+    days after downtime, each rendering its own reading."""
+    yesterday = mock_today() - timedelta(days=1)
+    portal.app["state"]["published_through"] = yesterday - timedelta(days=gap_days)
+    entry = await _setup_entry(hass, portal, monctonwater_urls)
+    rows = await _statistic_rows(hass)
+    assert _local(rows[-1]).date() == yesterday - timedelta(days=gap_days)
+
+    portal.app["state"]["published_through"] = yesterday
+    await _refresh(hass, entry)
+    rows = await _statistic_rows(hass)
+    assert _local(rows[-1]).date() == yesterday
+    sums = [row["sum"] for row in rows]
+    assert sums == sorted(sums)
+    changes = _day_changes(rows)
+    for i in range(gap_days + 3):
+        day = yesterday - timedelta(days=i)
+        assert changes[day] == pytest.approx(daily_value(day), abs=0.001), day
+
+
+async def test_usage_statistic_reimports_revised_day(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """The portal publishes yesterday in stages (live: 0.582 m³ at 02:00,
+    revised to 0.659 m³ by 06:00): the trailing days are imported again
+    whenever their totals change."""
+    yesterday = mock_today() - timedelta(days=1)
+    portal.app["state"]["published_hours"] = {yesterday: 12}
+    entry = await _setup_entry(hass, portal, monctonwater_urls)
+    partial = sum(hourly_values(yesterday)[:12])
+    assert _day_changes(await _statistic_rows(hass))[yesterday] == pytest.approx(
+        partial, abs=0.001
     )
 
-    # Every era day renders its real reading: the day's rendered total
-    # (sum of its rows' changes, chained against the actual previous
-    # row — the pre-era boundary row is a midnight day row) equals the
-    # mock's daily value.
-    ordered = sorted(by_start.items())
-    changes_by_day: dict[date, float] = {}
-    for i, (ts, value) in enumerate(ordered):
-        local_day = dt_util.utc_from_timestamp(ts).astimezone(dt_util.DEFAULT_TIME_ZONE).date()
-        change = value if i == 0 else value - ordered[i - 1][1]
-        changes_by_day[local_day] = changes_by_day.get(local_day, 0.0) + change
-    day = start
-    while day <= yesterday:
-        assert changes_by_day.get(day) == pytest.approx(
-            daily_value(day), abs=0.02
-        ), day
-        day += timedelta(days=1)
+    # Still partial: the import settles on the portal's current totals.
+    await _refresh(hass, entry)
+    assert entry.runtime_data.stored_import_totals() is not None
 
-    # The pre-era boundary hands off cleanly: the era's first hour
-    # chains from the pre-era spread day row (at its midnight, not the
-    # previous hour), and the whole series ends at exactly 0.
-    first_era_ts = round(dt_util.start_of_local_day(start).timestamp())
-    pre_era = by_start.get(first_era_ts - 86400)
-    assert pre_era is not None, "expected a pre-era spread row before the era"
-    last_imported = max(
-        ts for ts in by_start
-        if dt_util.utc_from_timestamp(ts).astimezone(dt_util.DEFAULT_TIME_ZONE).date() <= yesterday
+    # The rest of the day publishes: same last day, revised total.
+    portal.app["state"]["published_hours"] = {}
+    await _refresh(hass, entry)
+    rows = await _statistic_rows(hass)
+    assert _day_changes(rows)[yesterday] == pytest.approx(daily_value(yesterday), abs=0.001)
+    sums = [row["sum"] for row in rows]
+    assert sums == sorted(sums)
+
+
+async def test_usage_statistic_rebuilt_after_clear(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """Clearing the statistic (Developer tools > Statistics) makes the next
+    refresh rebuild it from scratch."""
+    from homeassistant.components.recorder import get_instance
+
+    entry = await _setup_entry(hass, portal, monctonwater_urls)
+    before = await _statistic_rows(hass)
+    get_instance(hass).async_clear_statistics([STATISTIC_ID])
+    assert await _statistic_rows(hass) == []
+
+    await _refresh(hass, entry)
+    after = await _statistic_rows(hass)
+    assert [(row["start"], row["sum"]) for row in after] == [
+        (row["start"], row["sum"]) for row in before
+    ]
+
+
+async def test_rebuild_history_action(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """monctonwater.rebuild_history clears the statistic, stray rows
+    included, and imports the history again."""
+    from homeassistant.components.recorder.models import StatisticData
+    from homeassistant.components.recorder.statistics import async_add_external_statistics
+
+    from custom_components.monctonwater.statistics import _metadata
+
+    entry = await _setup_entry(hass, portal, monctonwater_urls)
+    before = await _statistic_rows(hass)
+    # A stray row no refresh would ever touch.
+    stray = dt_util.start_of_local_day(smart_meter_start() - timedelta(days=2000))
+    async_add_external_statistics(
+        hass, _metadata(entry), [StatisticData(start=stray, state=999.0, sum=999.0)]
     )
-    assert by_start[last_imported] == pytest.approx(0.0, abs=0.01)
+    assert len(await _statistic_rows(hass)) == len(before) + 1
 
-    # Consecutive sum deltas are never negative.
-    sums_ordered = [r["sum"] for r in rows if r["sum"] is not None]
-    changes = [sums_ordered[i] - sums_ordered[i - 1] for i in range(1, len(sums_ordered))]
-    assert all(c >= -0.002 for c in changes), "negative rendered consumption"
+    await hass.services.async_call(DOMAIN, "rebuild_history", blocking=True)
+    after = await _statistic_rows(hass)
+    assert [(row["start"], row["sum"]) for row in after] == [
+        (row["start"], row["sum"]) for row in before
+    ]
 
-    assert entry.runtime_data.backfill_complete is True
-    assert entry.runtime_data.hourly_complete is True
-    assert entry.runtime_data.stored_hourly_through() == yesterday
+
+async def test_billed_only_account_usage_statistic(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+    monkeypatch,
+):
+    """Without smart-meter data the statistic is the billed periods spread
+    across their days, growing as new periods bill."""
+    import conftest as cf
+
+    portal.app["state"]["smart_meter_empty"] = True
+    entry = await _setup_entry(hass, portal, monctonwater_urls)
+    rows = await _statistic_rows(hass)
+    reads = billed_readings()  # newest first
+    assert all(_local(row).hour == 0 for row in rows)
+    assert _local(rows[-1]).date() == reads[0][0]
+    assert rows[-1]["sum"] == pytest.approx(sum(m3 for _, m3 in reads), abs=0.01)
+
+    new_read = reads[0][0] + timedelta(days=21)
+    original = cf.consumption_page
+    monkeypatch.setattr(
+        cf, "consumption_page", lambda state: original(state, [(new_read, 30.0), *reads])
+    )
+    await _refresh(hass, entry)
+    rows = await _statistic_rows(hass)
+    assert _local(rows[-1]).date() == new_read
+    assert rows[-1]["sum"] == pytest.approx(sum(m3 for _, m3 in reads) + 30.0, abs=0.01)
+
+
+async def test_usage_statistic_without_backfill_starts_recently(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """With the backfill option off, the statistic starts with the trailing
+    days instead of the whole history."""
+    from custom_components.monctonwater.const import REIMPORT_DAYS
+
+    await _setup_entry(hass, portal, monctonwater_urls, backfill_daily=False)
+    yesterday = mock_today() - timedelta(days=1)
+    assert sorted(_day_changes(await _statistic_rows(hass))) == [
+        yesterday - timedelta(days=i) for i in range(REIMPORT_DAYS, -1, -1)
+    ]
 
 
 async def test_config_flow_success(
@@ -475,94 +561,6 @@ async def test_cumulative_sensor_holds_on_downward_revision(
     assert after == before
 
 
-async def test_recent_hourly_followup_imports_new_days(
-    recorder_mock,
-    hass,
-    portal,
-    monctonwater_urls,
-    patched_helper_session,
-    enable_custom_integrations,
-):
-    """After the backfill, a newly published day arrives via the
-    post-refresh listener: the followup re-imports the trailing window
-    and advances the hourly progress."""
-    entry = await _setup_entry(hass, portal, monctonwater_urls)
-    await hass.async_block_till_done(wait_background_tasks=True)
-    coordinator = entry.runtime_data
-    yesterday = mock_today() - timedelta(days=1)
-    assert coordinator.stored_hourly_through() == yesterday
-
-    # Simulate the portal publishing a new day after the backfill
-    # completed: rewind the progress one day, then let a normal refresh
-    # trigger the followup listener.
-    await coordinator.store_hourly_progress(
-        yesterday - timedelta(days=1), coordinator.stored_hourly_seed()
-    )
-    await coordinator.async_refresh()
-    await hass.async_block_till_done(wait_background_tasks=True)
-
-    assert coordinator.stored_hourly_through() == yesterday
-
-
-async def _day_change(hass: HomeAssistant, entry: MockConfigEntry, day: date) -> float:
-    """The day's rendered consumption: its last sum minus the prior row's."""
-    from homeassistant.components.recorder import get_instance
-    from homeassistant.components.recorder.statistics import statistics_during_period
-
-    await get_instance(hass).async_block_till_done()
-    statistic_id = _entity_id(hass, entry, WATER_KEY)
-    start = dt_util.start_of_local_day(day)
-    stats = await get_instance(hass).async_add_executor_job(
-        statistics_during_period,
-        hass,
-        start - timedelta(hours=1),
-        start + timedelta(days=1),
-        {statistic_id},
-        "hour",
-        None,
-        {"sum"},
-    )
-    rows = sorted(stats[statistic_id], key=lambda r: r["start"])
-    return rows[-1]["sum"] - rows[0]["sum"]
-
-
-async def test_recent_hourly_reimports_revised_day(
-    recorder_mock,
-    hass,
-    portal,
-    monctonwater_urls,
-    patched_helper_session,
-    enable_custom_integrations,
-):
-    """The portal publishes yesterday progressively (live: 0.582 m³ at
-    02:00, revised to 0.659 m³ by 06:00). A revised daily total must
-    re-import the trailing window even though the day was imported."""
-    entry = await _setup_entry(hass, portal, monctonwater_urls)
-    await hass.async_block_till_done(wait_background_tasks=True)
-    coordinator = entry.runtime_data
-    yesterday = mock_today() - timedelta(days=1)
-
-    # Yesterday first appears with only its first 12 hours published.
-    portal.app["state"]["published_hours"] = {yesterday: 12}
-    await coordinator.store_hourly_progress(
-        yesterday - timedelta(days=1), coordinator.stored_hourly_seed()
-    )
-    await coordinator.async_refresh()
-    await hass.async_block_till_done(wait_background_tasks=True)
-    assert coordinator.stored_hourly_through() == yesterday
-    assert await _day_change(hass, entry, yesterday) == pytest.approx(
-        sum(hourly_values(yesterday)[:12]), abs=0.005
-    )
-
-    # The rest of the day publishes: same last day, revised total.
-    portal.app["state"]["published_hours"] = {}
-    await coordinator.async_refresh()
-    await hass.async_block_till_done(wait_background_tasks=True)
-    assert await _day_change(hass, entry, yesterday) == pytest.approx(
-        daily_value(yesterday), abs=0.005
-    )
-
-
 async def test_billed_table_read_once_a_day(
     recorder_mock,
     hass,
@@ -697,7 +695,7 @@ async def test_redated_billed_read_is_not_double_counted(
     assert float(hass.states.get(water_id).state) == pytest.approx(before)
 
 
-async def test_stats_generation_reset_keeps_billed_history(
+async def test_stored_billed_history_survives_upgrade(
     recorder_mock,
     hass,
     hass_storage,
@@ -706,14 +704,10 @@ async def test_stats_generation_reset_keeps_billed_history(
     patched_helper_session,
     enable_custom_integrations,
 ):
-    """A statistics-convention reset re-imports the statistics but must
-    keep the billed quarters the portal's rolling window has dropped —
-    they cannot be fetched again."""
-    from custom_components.monctonwater.const import (
-        STATS_GEN,
-        STORAGE_KEY,
-        STORAGE_VERSION,
-    )
+    """Storage written by earlier versions (with their backfill flags)
+    still yields the billed quarters the portal's rolling window has
+    dropped: they cannot be fetched again."""
+    from custom_components.monctonwater.const import STORAGE_KEY, STORAGE_VERSION
 
     monctonwater_urls(server_base(portal))
     entry = MockConfigEntry(
@@ -730,14 +724,19 @@ async def test_stats_generation_reset_keeps_billed_history(
         "minor_version": 1,
         "key": f"{STORAGE_KEY}.{entry.entry_id}",
         "data": {
-            "stats_gen": STATS_GEN - 1,
+            "stats_gen": 5,
             "stats_imported": True,
+            "backfill_complete": True,
+            "hourly_complete": True,
+            "hourly_through": "2026-09-30",
+            "hourly_seed": 0.0,
+            "hourly_totals": None,
             "last_cumulative_m3": 1.0,
             "billed_history": [[rolled_off.isoformat(), 55.0]],
         },
     }
     assert await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
 
     history = entry.runtime_data.merged_billed([])
     assert rolled_off in [r.read_date for r in history]

@@ -1,37 +1,34 @@
-"""Historical water usage import into the recorder statistics table.
+"""Usage history as an external long-term statistic.
 
-The Energy dashboard's water section consumes long-term statistics and
-renders each period's consumption as ``change = sum - prev_sum`` — the
-``sum`` column must therefore be a **cumulative counter** (the running
-total at the END of each period), exactly the way the recorder compiles
-native statistics for ``total_increasing`` sensors. Earlier versions of
-this module wrote per-period amounts into ``sum``, which rendered as
-negative consumption whenever usage fell versus the previous period.
+The Energy dashboard renders a statistic's consumption per period as
+``sum - previous sum``, so a statistic must be one cumulative chain. The
+portal publishes usage a day late (yesterday appears within 24 hours,
+in stages), and the water sensor's own statistic cannot hold that
+history: HA compiles it from the sensor's live state, booking each day
+when it publishes. Importing history into it as well leaves two
+cumulative chains in one statistic, and they never line up.
 
-History is backfilled in three phases, each replacing the previous
-phase's rows in place (``async_import_statistics`` updates same-period
-rows) so no re-import ever duplicates:
+So the history lives in a statistic of its own,
+``monctonwater:water_usage_<account>``, written only by this module:
 
-1. **Immediate (day resolution)**: every billed period (~3 years,
-   quarterly) spread evenly across its days, plus the trailing daily
-   window already fetched by the first refresh, imported during setup.
-2. **Background (real daily rows)**: the smart meter's daily history is
-   re-fetched in 90-day page windows and replaces the spread estimates.
-3. **Background (hourly resolution)**: the portal's CSV export (which
-   serves hourly values for the session's last queried range) is walked
-   in 90-day windows — three requests each — and replaces each day's
-   midnight row with 24 hourly rows.
+* before the smart meter: billed periods spread evenly across their
+  days (one row per day, at local midnight);
+* the smart-meter era: hourly rows from the portal's CSV export, the
+  single source of truth for that era (its hourly and daily numbers
+  agree; the daily page's drift ~2 m³ over two years).
 
-After the backfills, each coordinator refresh imports hourly rows for
-newly published days so recent history keeps hourly resolution.
-Imported periods always end before the entity's first native statistic,
-so imports never collide with recorder-generated rows.
+Every run reads the statistic's last row back from the recorder and
+continues the chain from it. An empty statistic — first setup, or
+cleared by the user — gets the full backfill; afterwards new days are
+appended (catching up after any downtime), and the trailing days are
+imported again while the portal is still revising them.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
 
@@ -43,26 +40,27 @@ from homeassistant.components.recorder.models import (
     StatisticMetaData,
 )
 from homeassistant.components.recorder.statistics import (
-    async_import_statistics,
+    async_add_external_statistics,
+    get_last_statistics,
     statistics_during_period,
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 
-from .api import BilledReading, DailyReading, HourlyReading, MonctonWaterClient
+from .api import BilledReading, HourlyReading, MonctonWaterClient
 from .const import (
     BACKFILL_MAX_DAYS,
     BACKFILL_REQUEST_PAUSE,
+    CONF_BACKFILL_DAILY,
     DOMAIN,
     QUERY_WINDOW_DAYS,
     REIMPORT_DAYS,
 )
 from .coordinator import ATTR_DAILY_M3, MonctonWaterCoordinator
-from .exceptions import MonctonWaterError, MonctonWaterSessionError
-from .sensor import UNIQUE_ID_TEMPLATE, WATER_KEY
+from .exceptions import MonctonWaterApiError, MonctonWaterError, MonctonWaterSessionError
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -70,8 +68,40 @@ _LOGGER = logging.getLogger(__name__)
 # no previous read to anchor its span, so assume one standard period.
 ASSUMED_FIRST_PERIOD_DAYS = 91
 
-# Rows per async_import_statistics call during the hourly backfill.
-HOURLY_IMPORT_CHUNK = 2160
+# Rows per statistics import call.
+IMPORT_CHUNK = 2160
+
+# A re-imported day counts as settled once its hourly rows add up to the
+# portal's daily total within this; until then each refresh retries.
+SETTLED_TOLERANCE_M3 = 0.02
+
+# How far back to look for the row a re-import continues from.
+SEED_LOOKBACK_DAYS = 14
+
+# What a portal run can fail with; the next refresh tries again.
+_PORTAL_ERRORS = (MonctonWaterError, TimeoutError, OSError, aiohttp.ClientError)
+
+
+def _account(entry: ConfigEntry) -> str:
+    return (entry.unique_id or "").removeprefix("account_") or entry.entry_id
+
+
+def statistic_id(entry: ConfigEntry) -> str:
+    """Return the entry's usage statistic: monctonwater:water_usage_<account>."""
+    slug = re.sub(r"[^a-z0-9]+", "_", _account(entry).lower()).strip("_")
+    return f"{DOMAIN}:water_usage_{slug}"
+
+
+def _metadata(entry: ConfigEntry) -> StatisticMetaData:
+    return StatisticMetaData(
+        mean_type=StatisticMeanType.NONE,
+        has_sum=True,
+        name=f"Moncton Water usage ({_account(entry)})",
+        source=DOMAIN,
+        statistic_id=statistic_id(entry),
+        unit_class="volume",
+        unit_of_measurement=UnitOfVolume.CUBIC_METERS,
+    )
 
 
 def billed_spans(
@@ -95,117 +125,99 @@ def billed_spans(
     return spans
 
 
-def daily_points(
-    billed: list[BilledReading],
-    daily: list[DailyReading],
-    today: date,
+def spread_days(
+    spans: list[tuple[date, date, float]], first: date, last: date
 ) -> list[tuple[date, float]]:
-    """Expand history into (day, m³) points, skipping today.
+    """(day, m³) for every day in [first, last] a billed span covers.
 
-    Billed periods are spread evenly across their days; real smart-meter
-    daily readings override the spread for their days (one point per
-    day, so every phase's series totals the same amount — the anchor
-    the re-anchoring below depends on).
+    Each period's consumption is spread evenly across its days, so a
+    whole period adds back up to its bill.
     """
-    points: dict[date, float] = {}
-    for start, end, consumption in billed_spans(billed):
-        days = (end - start).days + 1
-        per_day = round(consumption / days, 5)
-        for i in range(days):
-            points[start + timedelta(days=i)] = per_day
-    for reading in daily:
-        if reading.consumption_m3 is not None:
-            points[reading.day] = reading.consumption_m3
-    return [p for p in sorted(points.items()) if p[0] < today]
+    days: list[tuple[date, float]] = []
+    for start, end, consumption in spans:
+        per_day = consumption / ((end - start).days + 1)
+        day = max(start, first)
+        while day <= min(end, last):
+            days.append((day, per_day))
+            day += timedelta(days=1)
+    return days
 
 
-def _metadata(statistic_id: str) -> StatisticMetaData:
-    return StatisticMetaData(
-        mean_type=StatisticMeanType.NONE,
-        has_sum=True,
-        name=None,
-        source="recorder",
-        statistic_id=statistic_id,
-        unit_class="volume",
-        unit_of_measurement=UnitOfVolume.CUBIC_METERS,
-    )
-
-
-def _rows_to_statistics(points: list[tuple[date, float]]) -> list[StatisticData]:
-    """Build day rows with cumulative sums; see :func:`_reanchor`."""
-    statistics: list[StatisticData] = []
-    cumulative = 0.0
-    for day, consumption in points:
-        cumulative += consumption
-        statistics.append(
+def _day_rows(
+    days: list[tuple[date, float]], seed: float
+) -> tuple[list[StatisticData], float]:
+    """One row per day at local midnight; return (rows, running total)."""
+    rows: list[StatisticData] = []
+    total = seed
+    for day, consumption in days:
+        total += consumption
+        rows.append(
             StatisticData(
                 start=dt_util.start_of_local_day(day),
-                state=round(cumulative, 3),
-                sum=round(cumulative, 3),
+                state=round(total, 3),
+                sum=round(total, 3),
             )
         )
-    return _reanchor(statistics)
-
-
-def _reanchor(rows: list[StatisticData]) -> list[StatisticData]:
-    """Shift a cumulative series so its final row's sum is 0.
-
-    The dashboard renders consumption as the difference of consecutive
-    sums, so imported sums must be cumulative — but the recorder's
-    native rows for the same entity anchor their own cumulative sum at
-    0 from entity creation. Ending the imported series at 0 makes the
-    imported→native boundary render as a clean gap of 0 instead of a
-    huge negative spike. Deltas (the rendered consumption) are
-    unaffected; only the raw ``sum`` column becomes negative for old
-    history, which nothing but the statistics debug graph displays.
-    """
-    if not rows:
-        return rows
-    final = rows[-1]["sum"] or 0.0
-    return [
-        StatisticData(
-            start=row["start"],
-            state=round((row["state"] or 0.0) - final, 3),
-            sum=round((row["sum"] or 0.0) - final, 3),
-        )
-        for row in rows
-    ]
+    return rows, total
 
 
 def _hourly_rows(
     readings: list[HourlyReading], seed: float
 ) -> tuple[list[StatisticData], float]:
-    """Build cumulative hourly statistic rows; return (rows, final seed)."""
-    statistics: list[StatisticData] = []
-    cumulative = seed
+    """Hour-beginning rows (local wall clock); return (rows, running total)."""
+    rows: list[StatisticData] = []
+    total = seed
     for reading in readings:
         day_start = dt_util.start_of_local_day(reading.day)
         for hour, value in enumerate(reading.values):
-            cumulative += value
-            statistics.append(
+            total += value
+            rows.append(
                 StatisticData(
                     start=day_start + timedelta(hours=hour),
-                    state=round(cumulative, 3),
-                    sum=round(cumulative, 3),
+                    state=round(total, 3),
+                    sum=round(total, 3),
                 )
             )
-    return statistics, round(cumulative, 3)
+    return rows, total
 
 
-def _water_statistic_id(hass: HomeAssistant, entry: ConfigEntry) -> str | None:
-    registry = er.async_get(hass)
-    return registry.async_get_entity_id(
-        "sensor",
-        DOMAIN,
-        UNIQUE_ID_TEMPLATE.format(entry_id=entry.entry_id, key=WATER_KEY),
+def _import(hass: HomeAssistant, entry: ConfigEntry, rows: list[StatisticData]) -> None:
+    metadata = _metadata(entry)
+    for i in range(0, len(rows), IMPORT_CHUNK):
+        async_add_external_statistics(hass, metadata, rows[i : i + IMPORT_CHUNK])
+
+
+async def _last_row(
+    hass: HomeAssistant, statistic: str
+) -> tuple[datetime, float] | None:
+    """Return the (start, sum) of the statistic's last row, if any."""
+    # The recorder's own executor: database access from HA's generic one
+    # is slower and logs a "without the database executor" warning.
+    stats = await get_instance(hass).async_add_executor_job(
+        get_last_statistics, hass, 1, statistic, False, {"sum"}
     )
+    rows = stats.get(statistic)
+    if not rows:
+        return None
+    return dt_util.utc_from_timestamp(rows[0]["start"]), rows[0]["sum"] or 0.0
 
 
-def _billed(coordinator: MonctonWaterCoordinator) -> list[BilledReading]:
-    # Every refresh — including the one that ran before any backfill —
-    # merges the portal's table into the persisted history, so there is
-    # no need to render the page again.
-    return coordinator.history_billed or coordinator.billed_history()
+async def _sum_before(
+    hass: HomeAssistant, statistic: str, before: datetime
+) -> float | None:
+    """Return the sum of the statistic's last row before ``before``."""
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        before - timedelta(days=SEED_LOOKBACK_DAYS),
+        before,
+        {statistic},
+        "hour",
+        None,
+        {"sum"},
+    )
+    rows = stats.get(statistic) or []
+    return rows[-1]["sum"] if rows else None
 
 
 async def _portal_call[_T](
@@ -223,35 +235,7 @@ async def _portal_call[_T](
         return await call()
 
 
-async def async_import_history_statistics(
-    hass: HomeAssistant, entry: ConfigEntry, coordinator: MonctonWaterCoordinator
-) -> None:
-    """Phase 1: import the already-fetched history at day resolution."""
-    if coordinator.stats_imported:
-        return
-    statistic_id = _water_statistic_id(hass, entry)
-    if statistic_id is None:
-        _LOGGER.warning("Water sensor not registered yet; will retry statistics import")
-        return
-    if not coordinator.history_billed:
-        _LOGGER.info("No usage history available; skipping statistics import")
-        await coordinator.mark_stats_imported()
-        return
-
-    points = daily_points(
-        coordinator.history_billed, coordinator.history_daily, dt_util.now().date()
-    )
-    if points:
-        async_import_statistics(hass, _metadata(statistic_id), _rows_to_statistics(points))
-        _LOGGER.info(
-            "Imported %s day-resolution statistics for %s", len(points), statistic_id
-        )
-    await coordinator.mark_stats_imported()
-
-
-def _walk_windows(
-    today: date, floor: date
-) -> list[tuple[date, date]]:
+def _walk_windows(today: date, floor: date) -> list[tuple[date, date]]:
     """90-day (from, to) windows from yesterday back to the floor."""
     windows: list[tuple[date, date]] = []
     window_to = today - timedelta(days=1)
@@ -262,220 +246,228 @@ def _walk_windows(
     return windows
 
 
-async def async_backfill_hourly_statistics(
+async def _fetch_hourly(
+    client: MonctonWaterClient, first: date, last: date
+) -> list[HourlyReading]:
+    """Hourly readings for [first, last] via the CSV export, oldest first."""
+    by_day: dict[date, HourlyReading] = {}
+    window_from = first
+    while window_from <= last:
+        window_to = min(window_from + timedelta(days=QUERY_WINDOW_DAYS - 1), last)
+        batch = await _portal_call(
+            client,
+            lambda: client.get_hourly_csv(window_from, window_to),  # noqa: B023
+        )
+        by_day.update((reading.day, reading) for reading in batch)
+        window_from = window_to + timedelta(days=1)
+        if window_from <= last:
+            await asyncio.sleep(BACKFILL_REQUEST_PAUSE)
+    return [by_day[day] for day in sorted(by_day)]
+
+
+async def async_update_usage_statistic(
     hass: HomeAssistant, entry: ConfigEntry, coordinator: MonctonWaterCoordinator
 ) -> None:
-    """Background backfill: rebuild the whole series at hourly resolution.
+    """Create or extend the entry's usage statistic (see module docstring).
 
-    Walks the portal's CSV export (the single source of truth for the
-    smart-meter era — its hourly and daily numbers agree with each
-    other, while the daily page's numbers drift ~2 m³ over two years)
-    in 90-day windows from yesterday back to the meter's activation.
-    The imported series is ONE continuous cumulative chain:
-
-    * pre-era billing periods, spread evenly across their days, shifted
-      so the last pre-era row sits at ``-era_total``;
-    * the era's hourly rows chained from there, ending at **exactly 0**.
-
-    Ending at 0 is the point: the recorder's native rows for the same
-    entity anchor their own cumulative sum at 0 from entity creation,
-    and the dashboard renders the difference of consecutive sums — a
-    series ending anywhere else books a huge step at the imported→native
-    frontier, and a per-refresh continuation would move that step to the
-    current day forever. The walk is ~16 windows; an interrupted run
-    rewinds and rewalks.
+    Runs at setup and after every coordinator refresh. Portal errors are
+    logged and left to the next run.
     """
-    if coordinator.backfill_complete:
-        return
-    statistic_id = _water_statistic_id(hass, entry)
-    if statistic_id is None:
-        return
-    client = coordinator.client
-    today = dt_util.now().date()
-
-    billed = _billed(coordinator)
-    earliest_billed = billed[0].read_date if billed else today - timedelta(
-        days=BACKFILL_MAX_DAYS
-    )
-
-    # Keyed by day: a day the walk sees twice must not be counted twice.
-    by_day: dict[date, HourlyReading] = {}
-    floor = min(earliest_billed, today - timedelta(days=BACKFILL_MAX_DAYS))
-    for window_from, window_to in _walk_windows(today, floor):
+    async with coordinator.statistic_lock:
         try:
+            await _update(hass, entry, coordinator)
+        except _PORTAL_ERRORS as err:
+            _LOGGER.warning(
+                "Usage statistic %s not updated (%r); the next refresh retries",
+                statistic_id(entry),
+                err,
+            )
+
+
+async def async_rebuild_usage_statistic(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator: MonctonWaterCoordinator
+) -> None:
+    """Clear the entry's usage statistic and import it again from scratch."""
+    async with coordinator.statistic_lock:
+        recorder = get_instance(hass)
+        recorder.async_clear_statistics([statistic_id(entry)])
+        await recorder.async_block_till_done()
+        await coordinator.store_import_totals(None)
+        try:
+            await _update(hass, entry, coordinator)
+        except _PORTAL_ERRORS as err:
+            raise HomeAssistantError(
+                f"Rebuilding {statistic_id(entry)} failed ({err!r}); "
+                "the next refresh tries again"
+            ) from err
+
+
+async def _update(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator: MonctonWaterCoordinator
+) -> None:
+    if coordinator.data is None:
+        return
+    last = await _last_row(hass, statistic_id(entry))
+    if last is None:
+        await _backfill(
+            hass, entry, coordinator, full=entry.options.get(CONF_BACKFILL_DAILY, True)
+        )
+    else:
+        await _extend(hass, entry, coordinator, *last)
+    # The next run reads the chain back from the recorder, so what was
+    # just queued must be committed by then.
+    await get_instance(hass).async_block_till_done()
+
+
+async def _backfill(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: MonctonWaterCoordinator,
+    *,
+    full: bool,
+) -> None:
+    """Build the chain from scratch (empty statistic).
+
+    ``full`` walks the CSV export from yesterday back to the meter's
+    activation (~9 windows for two years) and spreads the billed periods
+    before it; otherwise the chain starts with the trailing days (or,
+    without smart-meter data, the latest billed period).
+    """
+    client = coordinator.client
+    last_daily: date | None = coordinator.data.get("last_daily_date")
+    today = dt_util.now().date()
+    spans = billed_spans(coordinator.billed_history())
+    if full:
+        floor = min(
+            spans[0][0] if spans else today, today - timedelta(days=BACKFILL_MAX_DAYS)
+        )
+    elif last_daily is not None:
+        floor = last_daily - timedelta(days=REIMPORT_DAYS)
+    else:
+        floor = spans[-1][0] if spans else today
+
+    by_day: dict[date, HourlyReading] = {}
+    if last_daily is not None:  # without smart-meter data, nothing to walk
+        for window_from, window_to in _walk_windows(today, floor):
             batch = await _portal_call(
                 client,
                 lambda: client.get_hourly_csv(window_from, window_to),  # noqa: B023
             )
-        except (MonctonWaterError, TimeoutError, OSError, aiohttp.ClientError) as err:
-            _LOGGER.warning(
-                "Hourly backfill stopped at %s (%r); it will retry on restart",
-                window_to,
-                err,
-            )
-            return
-        if not batch:
-            _LOGGER.debug("Hourly backfill reached the start of data at %s", window_from)
-            break
-        by_day.update((reading.day, reading) for reading in batch)
-        await asyncio.sleep(BACKFILL_REQUEST_PAUSE)
-
+            if not batch:
+                if not by_day:
+                    # The daily page has data, so an empty newest window
+                    # is a portal glitch, not an account without a meter.
+                    raise MonctonWaterApiError("CSV export served no recent data")
+                break  # the start of the meter era
+            by_day.update((reading.day, reading) for reading in batch)
+            await asyncio.sleep(BACKFILL_REQUEST_PAUSE)
     readings = [by_day[day] for day in sorted(by_day)]
-    if readings:
-        era_start = readings[0].day
 
-        # Era hourly rows end at exactly 0 by construction: the chain
-        # starts at minus the era total (accumulated in the same order
-        # as the rows are built, so float addition cannot drift).
-        era_total = 0.0
-        for reading in readings:
-            era_total += sum(reading.values)
-
-        rows: list[StatisticData] = []
-        # Pre-era spread, shifted to hand off to the era chain.
-        cumulative = 0.0
-        pre_era_points = [p for p in daily_points(billed, [], today) if p[0] < era_start]
-        pre_era_total = sum(value for _, value in pre_era_points)
-        for day, value in pre_era_points:
-            cumulative += value
-            shifted = cumulative - pre_era_total - era_total
-            rows.append(
-                StatisticData(
-                    start=dt_util.start_of_local_day(day),
-                    state=round(shifted, 3),
-                    sum=round(shifted, 3),
-                )
-            )
-
-        era_rows, _ = _hourly_rows(readings, -era_total)
-        rows.extend(era_rows)
-
-        for i in range(0, len(rows), HOURLY_IMPORT_CHUNK):
-            async_import_statistics(
-                hass, _metadata(statistic_id), rows[i : i + HOURLY_IMPORT_CHUNK]
-            )
-        await coordinator.store_hourly_progress(readings[-1].day, 0.0)
-        _LOGGER.info(
-            "Imported %s statistics (%s hourly days + %s spread days, "
-            "%s to %s, ending at 0) for %s",
-            len(rows),
-            len(readings),
-            len(pre_era_points),
-            rows[0]["start"].date(),
-            readings[-1].day,
-            statistic_id,
-        )
-    else:
-        _LOGGER.info("No smart-meter history found; keeping spread-only import")
-    await coordinator.mark_backfill_complete()
-    await coordinator.mark_hourly_complete()
-
-
-async def _last_sum_before(
-    hass: HomeAssistant, statistic_id: str, before: datetime
-) -> float | None:
-    """Return the cumulative sum of the last statistic row before ``before``."""
-    # The recorder's own executor: database access from HA's generic one
-    # is slower and logs a "without the database executor" warning.
-    stats = await get_instance(hass).async_add_executor_job(
-        statistics_during_period,
-        hass,
-        before - timedelta(days=2),
-        before,
-        (statistic_id,),
-        "hour",
-        None,
-        {"sum"},
+    # Billed spreads cover what the meter does not: up to its first
+    # reading, or every period for an account without a smart meter.
+    spread_last = (
+        readings[0].day - timedelta(days=1)
+        if readings
+        else (spans[-1][1] if spans else floor)
     )
-    rows = stats.get(statistic_id) or []
+    spread = spread_days(spans, floor, spread_last)
+    rows, total = _day_rows(spread, 0.0)
+    hourly, total = _hourly_rows(readings, total)
+    rows.extend(hourly)
     if not rows:
-        return None
-    return rows[-1]["sum"]
+        _LOGGER.info("No usage history to import yet")
+        return
+    _import(hass, entry, rows)
+    _LOGGER.info(
+        "Imported %s rows into %s: %s spread days, %s hourly days, through %s (%.3f m³)",
+        len(rows),
+        statistic_id(entry),
+        len(spread),
+        len(readings),
+        readings[-1].day if readings else spread[-1][0],
+        total,
+    )
 
 
-async def async_import_recent_hourly(
-    hass: HomeAssistant, entry: ConfigEntry, coordinator: MonctonWaterCoordinator
+async def _extend(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: MonctonWaterCoordinator,
+    last_start: datetime,
+    last_sum: float,
 ) -> None:
-    """Keep recent days at hourly resolution.
-
-    Runs after each coordinator refresh once the hourly backfill has
-    completed. Re-imports the trailing few days (the recorder's native
-    rows book each day's usage as one lump when the portal publishes
-    it, and compaction may rewrite recent hours), chaining the
-    cumulative sums from the actual last stored row so the imported and
-    native series stay continuous.
-    """
-    if not coordinator.hourly_complete:
-        return
-    statistic_id = _water_statistic_id(hass, entry)
-    if statistic_id is None:
-        return
-    data = coordinator.data or {}
+    """Continue the chain from its last row."""
+    data = coordinator.data
+    last_local = dt_util.as_local(last_start)
+    last_day = last_local.date()
     last_daily: date | None = data.get("last_daily_date")
-    through = coordinator.stored_hourly_through()
-    if last_daily is None or through is None:
+
+    if last_daily is None:
+        # No smart-meter data this refresh. A chain of day rows (an
+        # account without a meter) grows as new periods bill; an hourly
+        # chain just waits for the meter's data to return.
+        if last_local.hour == 0:
+            spans = billed_spans(coordinator.billed_history())
+            if spans:
+                days = spread_days(spans, last_day + timedelta(days=1), spans[-1][1])
+                rows, _ = _day_rows(days, last_sum)
+                if rows:
+                    _import(hass, entry, rows)
+                    _LOGGER.info(
+                        "Extended %s with %s billed days", statistic_id(entry), len(rows)
+                    )
+        return
+    if last_daily < last_day:
+        # The portal's daily window fell behind the chain (a glitch):
+        # importing would leave the chain's newer rows stale. Wait.
         return
 
-    # Re-import the trailing window, not just the new day: the
-    # recorder's native rows book each day's usage as one lump when it
-    # publishes, and compaction can rewrite recent hours. The portal
-    # also publishes yesterday progressively (live: 0.582 m³ at 02:00,
-    # revised to 0.659 m³ by 06:00), so a revised daily total in the
-    # window re-imports it too.
-    start_day = last_daily - timedelta(days=REIMPORT_DAYS)
+    # The trailing days are imported again until the portal stops
+    # revising them: yesterday publishes in stages (live: 0.582 m³ at
+    # 02:00, revised to 0.659 m³ by 06:00).
+    trailing = last_daily - timedelta(days=REIMPORT_DAYS)
     daily: dict[str, float] = data.get(ATTR_DAILY_M3) or {}
     totals = {
         key: daily.get(key)
         for key in (
-            (start_day + timedelta(days=i)).isoformat()
-            for i in range(REIMPORT_DAYS + 1)
+            (trailing + timedelta(days=i)).isoformat() for i in range(REIMPORT_DAYS + 1)
         )
     }
-    if last_daily <= through and totals == coordinator.stored_hourly_totals():
-        return  # nothing new or revised since the last hourly import
-    seed = await _last_sum_before(
-        hass, statistic_id, dt_util.start_of_local_day(start_day)
-    )
-    if seed is None:
-        return  # nothing stored yet; the next run retries
+    if last_daily <= last_day and totals == coordinator.stored_import_totals():
+        return  # nothing new or revised since the last import
 
-    client = coordinator.client
-    rows: list[StatisticData] = []
-    day = start_day
-    while day <= last_daily:
-        try:
-            values = await _portal_call(
-                client,
-                lambda: client.get_hourly_values(day),  # noqa: B023
-            )
-        except (MonctonWaterError, TimeoutError, OSError, aiohttp.ClientError) as err:
-            _LOGGER.warning("Recent hourly import stopped at %s (%r)", day, err)
-            break
-        if not values:
-            break  # not published yet; a later refresh picks it up
-        day_rows, seed = _hourly_rows([HourlyReading(day=day, values=values)], seed)
-        rows.extend(day_rows)
-        day += timedelta(days=1)
-    if rows:
-        async_import_statistics(hass, _metadata(statistic_id), rows)
-        imported_through = day - timedelta(days=1)
-        # Remember the totals only for a complete window; otherwise the
-        # next refresh tries again.
-        await coordinator.store_hourly_progress(
-            imported_through,
-            seed,
-            totals if imported_through == last_daily else None,
-        )
-        _LOGGER.info(
-            "Imported %s recent hourly rows (%s to %s), through advanced to %s",
-            len(rows),
-            start_day,
-            day - timedelta(days=1),
-            day - timedelta(days=1),
-        )
+    # From the day after the chain's end when catching up after downtime,
+    # otherwise from the start of the trailing window.
+    readings = await _fetch_hourly(
+        coordinator.client, min(last_day + timedelta(days=1), trailing), last_daily
+    )
+    if not readings or readings[-1].day < last_day:
+        # Stopping short of the chain's end would leave stale rows after
+        # the re-imported ones; the export lags, so a later run retries.
+        return
+    first = readings[0].day
+    if first > last_day:
+        seed = last_sum
     else:
-        _LOGGER.warning(
-            "Recent hourly import produced no rows (start %s, last_daily %s)",
-            start_day,
-            last_daily,
+        seed = await _sum_before(
+            hass, statistic_id(entry), dt_util.start_of_local_day(first)
         )
+        if seed is None:
+            return
+    rows, _ = _hourly_rows(readings, seed)
+    _import(hass, entry, rows)
+
+    settled = readings[-1].day == last_daily and all(
+        abs(sum(reading.values) - daily[reading.day.isoformat()]) <= SETTLED_TOLERANCE_M3
+        for reading in readings
+        if reading.day >= trailing and reading.day.isoformat() in daily
+    )
+    await coordinator.store_import_totals(totals if settled else None)
+    _LOGGER.debug(
+        "Imported %s hourly rows into %s (%s to %s)%s",
+        len(rows),
+        statistic_id(entry),
+        first,
+        readings[-1].day,
+        "" if settled else "; not settled yet",
+    )

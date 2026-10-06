@@ -88,6 +88,11 @@ def hourly_values(day: date) -> list[float]:
     return values
 
 
+def published_until(state: dict) -> date:
+    """The last day the mock portal has published (default: yesterday)."""
+    return state.get("published_through") or mock_today() - timedelta(days=1)
+
+
 def published_hourly(state: dict, day: date) -> list[float]:
     """The day's hourly values as currently published.
 
@@ -194,7 +199,7 @@ def smart_meter_page(
         date_to = today - timedelta(days=1)
     days = [
         day
-        for day in _daterange(max(date_from, start), min(date_to, today - timedelta(days=1)))
+        for day in _daterange(max(date_from, start), min(date_to, published_until(state)))
     ]
     dates_js = ",".join(f'"{day.isoformat()}"' for day in days)
     values_js = ",".join(f"{published_daily(state, day):.5f}" for day in days)
@@ -225,8 +230,7 @@ var ajaxURL = "/app/capricorn?para=ajaxDownloadConsumptionData&type=smartmeter&i
 def hourly_page(state: dict, day: date) -> str:
     if not state.get("logged_in"):
         return LOGIN_PAGE
-    today = mock_today()
-    if not (smart_meter_start() <= day <= today - timedelta(days=1)):
+    if not (smart_meter_start() <= day <= published_until(state)):
         values_js = ""
     else:
         values = published_hourly(state, day)
@@ -258,7 +262,7 @@ def excel_export_csv(state: dict) -> str:
     header = ["Reading Date"] + [f"{h} CFF Usage" for h in range(1, 25)] + ["Total CFF Usage"]
     lines = [",".join(f'"{c}"' for c in header), "", ""]
     start = max(from_day, smart_meter_start())
-    end = min(to_day, mock_today() - timedelta(days=1))
+    end = min(to_day, published_until(state))
     day = start
     while day <= end:
         values = published_hourly(state, day)
