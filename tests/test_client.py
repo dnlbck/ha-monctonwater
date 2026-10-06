@@ -206,13 +206,25 @@ async def test_hourly_csv_window(client):
     from conftest import hourly_values
 
     today = mock_today()
-    readings = await client.get_hourly_csv(today - timedelta(days=200), today)
-    assert readings[0].day == smart_meter_start()
+    readings = await client.get_hourly_csv(today - timedelta(days=60), today)
+    assert readings[0].day == today - timedelta(days=60)
     assert readings[-1].day == today - timedelta(days=1)
     assert readings[10].values == hourly_values(readings[10].day)
     assert sum(readings[10].values) == pytest.approx(
         daily_value(readings[10].day), abs=0.001
     )
+
+
+@pytest.mark.asyncio
+async def test_hourly_csv_range_starting_before_the_meter(client):
+    """The mock reproduces the portal's quirk (seen live): a range that
+    starts before the meter's first reading gets only its last ten days,
+    the first of them cut short."""
+    start = smart_meter_start()
+    readings = await client.get_hourly_csv(start - timedelta(days=30), start + timedelta(days=40))
+    assert [r.day for r in readings] == [start + timedelta(days=31 + i) for i in range(10)]
+    assert sum(readings[0].values) < daily_value(readings[0].day)
+    assert sum(readings[1].values) == pytest.approx(daily_value(readings[1].day), abs=0.001)
 
 
 @pytest.mark.asyncio

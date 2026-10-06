@@ -235,17 +235,6 @@ async def _portal_call[_T](
         return await call()
 
 
-def _walk_windows(today: date, floor: date) -> list[tuple[date, date]]:
-    """90-day (from, to) windows from yesterday back to the floor."""
-    windows: list[tuple[date, date]] = []
-    window_to = today - timedelta(days=1)
-    while window_to >= floor:
-        window_from = max(window_to - timedelta(days=QUERY_WINDOW_DAYS - 1), floor)
-        windows.append((window_from, window_to))
-        window_to = window_from - timedelta(days=1)
-    return windows
-
-
 async def _fetch_hourly(
     client: MonctonWaterClient, first: date, last: date
 ) -> list[HourlyReading]:
@@ -329,7 +318,7 @@ async def _backfill(
     """Build the chain from scratch (empty statistic).
 
     ``full`` walks the CSV export from yesterday back to the meter's
-    activation (~9 windows for two years) and spreads the billed periods
+    activation (~12 windows for two years) and spreads the billed periods
     before it; otherwise the chain starts with the trailing days (or,
     without smart-meter data, the latest billed period).
     """
@@ -347,20 +336,34 @@ async def _backfill(
         floor = spans[-1][0] if spans else today
 
     by_day: dict[date, HourlyReading] = {}
-    if last_daily is not None:  # without smart-meter data, nothing to walk
-        for window_from, window_to in _walk_windows(today, floor):
-            batch = await _portal_call(
-                client,
-                lambda: client.get_hourly_csv(window_from, window_to),  # noqa: B023
-            )
-            if not batch:
-                if not by_day:
-                    # The daily page has data, so an empty newest window
-                    # is a portal glitch, not an account without a meter.
-                    raise MonctonWaterApiError("CSV export served no recent data")
-                break  # the start of the meter era
-            by_day.update((reading.day, reading) for reading in batch)
-            await asyncio.sleep(BACKFILL_REQUEST_PAUSE)
+    window_to = today - timedelta(days=1)
+    # Without smart-meter data there is nothing to walk.
+    while last_daily is not None and window_to >= floor:
+        window_from = max(window_to - timedelta(days=QUERY_WINDOW_DAYS - 1), floor)
+        batch = await _portal_call(
+            client,
+            lambda: client.get_hourly_csv(window_from, window_to),  # noqa: B023
+        )
+        if not batch:
+            if not by_day:
+                # The daily page has data, so an empty newest window is a
+                # portal glitch, not an account without a meter.
+                raise MonctonWaterApiError("CSV export served no recent data")
+            break  # the start of the meter era
+        known = min(by_day, default=None)
+        # This window's copy of a day wins: it completes the day the
+        # previous window cut short (below).
+        by_day.update((reading.day, reading) for reading in batch)
+        first = batch[0].day
+        if known is not None and first >= known:
+            break  # nothing older: the start of the meter era
+        # A window served in full continues just before itself. One served
+        # short — the meter's first days or, seen live, only the last ten
+        # days of a window that starts before the meter did, the first of
+        # them cut short — continues with a window ending on its first day,
+        # which brings that day back whole.
+        window_to = window_from - timedelta(days=1) if first == window_from else first
+        await asyncio.sleep(BACKFILL_REQUEST_PAUSE)
     readings = [by_day[day] for day in sorted(by_day)]
 
     # Billed spreads cover what the meter does not: up to its first

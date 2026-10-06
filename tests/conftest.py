@@ -52,10 +52,11 @@ ACCOUNTS = {"testuser": ACCOUNT_NUMBER, "otheruser": OTHER_ACCOUNT_NUMBER}
 METER_ID = "123456"
 SERVICE_ADDRESS = "1 TEST ST, MONCTON, NB E1A 1A1"
 
-# The mock's smart meter reports from this day (100 days of history, so
-# the backfill walk exercises a full window, a partial window, and an
-# empty one that stops the walk).
-SMART_METER_START_OFFSET_DAYS = 100
+# The mock's smart meter reports from this day: 121 days of history, so
+# the backfill's second 90-day window starts before the meter and hits
+# the export's quirk (only that window's last ten days) with older meter
+# days still to fetch.
+SMART_METER_START_OFFSET_DAYS = 121
 
 CSRF_TOKEN = "test-csrf-token-123"
 
@@ -254,18 +255,25 @@ def excel_export_csv(state: dict) -> str:
 
     Mirrors the real export: a header with 24 (mislabelled CFF) hourly
     columns plus a total, a row per day, and padding rows the parser
-    must skip.
+    must skip. Also its quirk, seen live: a range that starts before the
+    meter's first reading gets only its last ten days, the first of them
+    cut short (here, its first 12 hours read 0).
     """
     from_day, to_day = state.get("csv_range", (None, None))
     if from_day is None:
         return ""
     header = ["Reading Date"] + [f"{h} CFF Usage" for h in range(1, 25)] + ["Total CFF Usage"]
     lines = [",".join(f'"{c}"' for c in header), "", ""]
+    cut_short = None
+    if from_day < smart_meter_start():
+        from_day = cut_short = to_day - timedelta(days=9)
     start = max(from_day, smart_meter_start())
     end = min(to_day, published_until(state))
     day = start
     while day <= end:
         values = published_hourly(state, day)
+        if day == cut_short:
+            values = [0.0] * 12 + values[12:]
         cells = [day.isoformat()] + [f"{v:.5f}" for v in values] + [f"{sum(values):.5f}"]
         lines.append(",".join(cells))
         day += timedelta(days=1)
