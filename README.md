@@ -35,9 +35,11 @@ traffic in September 2026.
 - Latest daily usage, latest billed amount, trailing-window daily
   average; account/meter/address attributes
 
-Only two API calls are made per refresh (billed table + daily window).
-Daily readings publish once per day (yesterday's usage appears within
-24 hours).
+Each refresh reads one page, the smart meter's daily window; the billed
+table, which only changes quarterly, is re-read once a day. Daily
+readings publish once per day — yesterday's usage appears within 24
+hours, sometimes in stages, and recent days are re-imported when the
+portal revises them.
 
 ## Entities
 
@@ -53,6 +55,8 @@ The water usage sensor also exposes `account_number`, `meter_id`,
 (the trailing window) as attributes.
 
 ## Installation
+
+Requires Home Assistant 2025.11 or newer.
 
 ### HACS
 
@@ -137,6 +141,7 @@ captured real-portal markup in `tests/fixtures/`.
   the portal at any time. Use a reasonable polling interval (the
   default 4 h is generous; the data updates about daily).
 - Multi-account profiles: the portal's *active* account is used.
+  Separate MyAccount logins can each be added as their own entry.
 - This project is not affiliated with the City of Moncton.
 
 ## License

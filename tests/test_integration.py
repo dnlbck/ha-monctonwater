@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pytest
-from homeassistant.config_entries import SOURCE_USER
+from homeassistant.config_entries import SOURCE_USER, ConfigEntryState
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
@@ -15,9 +15,13 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from conftest import (
     ACCOUNT_NUMBER,
+    OTHER_ACCOUNT_NUMBER,
     VALID_CREDS,
     billed_readings,
     daily_value,
+    expire_sessions,
+    mock_today,
+    hourly_values,
     server_base,
     smart_meter_start,
 )
@@ -34,7 +38,7 @@ def _expected_sensor_cumulative() -> float:
     """The counter: billed periods plus daily rows after the last read."""
     billed = billed_readings()
     last_read = billed[0][0]
-    today = date.today()
+    today = mock_today()
     total = sum(m3 for _, m3 in billed)
     day = max(smart_meter_start(), last_read + timedelta(days=1))
     while day <= today - timedelta(days=1):
@@ -46,7 +50,7 @@ def _expected_sensor_cumulative() -> float:
 def _expected_cumulative() -> float:
     """Spread total with the fetched window's days replaced by real readings."""
     billed = billed_readings()
-    today = date.today()
+    today = mock_today()
     window_from = max(smart_meter_start(), today - timedelta(days=100))
     total = 0.0
     for i, (read, m3) in enumerate(billed):
@@ -91,8 +95,17 @@ async def _setup_entry(
     )
     entry.add_to_hass(hass)
     assert await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done()
+    # The backfill and hourly followup run as background tasks.
+    await hass.async_block_till_done(wait_background_tasks=True)
     return entry
+
+
+def _is_spring_forward(day: date) -> bool:
+    """Whether the local day is 23 hours long (compare in UTC: aware
+    datetimes sharing a tzinfo subtract as wall-clock times)."""
+    start = dt_util.as_utc(dt_util.start_of_local_day(day))
+    end = dt_util.as_utc(dt_util.start_of_local_day(day + timedelta(days=1)))
+    return end - start < timedelta(hours=24)
 
 
 def _entity_id(hass: HomeAssistant, entry: MockConfigEntry, key: str) -> str:
@@ -124,7 +137,7 @@ async def test_setup_creates_sensors(
 
     last_daily = hass.states.get(_entity_id(hass, entry, "last_daily_water"))
     assert float(last_daily.state) == pytest.approx(
-        daily_value(date.today() - timedelta(days=1))
+        daily_value(mock_today() - timedelta(days=1))
     )
 
 
@@ -237,10 +250,14 @@ async def test_hourly_backfill_upgrades_resolution(
     ]
     assert hourly_rows, "expected hourly (non-midnight) statistic rows"
     start = smart_meter_start()
-    yesterday = date.today() - timedelta(days=1)
-    # 24 rows per day for every day of the meter era (hour 0 shares
-    # midnight with the day row).
-    assert len(hourly_rows) == 23 * 100
+    yesterday = mock_today() - timedelta(days=1)
+    # 23 rows after midnight per day of the meter era (hour 0 shares
+    # midnight with the day row) — one fewer on a spring-forward day,
+    # whose 02:00 does not exist on the wall clock.
+    era_days = [start + timedelta(days=i) for i in range((yesterday - start).days + 1)]
+    assert len(hourly_rows) == sum(
+        22 if _is_spring_forward(day) else 23 for day in era_days
+    )
 
     # Every era day renders its real reading: the day's rendered total
     # (sum of its rows' changes, chained against the actual previous
@@ -295,7 +312,7 @@ async def test_config_flow_success(
         result["flow_id"],
         FLOW_INPUT,
     )
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert result["type"] == FlowResultType.CREATE_ENTRY
     assert result["title"] == ACCOUNT_TITLE
     assert len(hass.config_entries.async_entries(DOMAIN)) == 1
@@ -314,6 +331,40 @@ async def test_config_flow_wrong_password(
     )
     assert result["type"] == FlowResultType.FORM
     assert result["errors"] == {"base": "invalid_auth"}
+
+
+async def test_two_accounts_side_by_side(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """Separate MyAccount logins coexist: each entry keeps its own portal
+    session, so after the sessions lapse each signs back in to its own
+    account."""
+    first = await _setup_entry(hass, portal, monctonwater_urls, backfill_daily=False)
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": SOURCE_USER}
+    )
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_USERNAME: "otheruser", CONF_PASSWORD: VALID_CREDS["otheruser"]},
+    )
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert result["type"] == FlowResultType.CREATE_ENTRY
+    assert result["title"] == f"Moncton Water {OTHER_ACCOUNT_NUMBER}"
+    second = result["result"]
+
+    expire_sessions(portal)
+    for entry in (first, second):
+        await entry.runtime_data.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert [entry.runtime_data.data["account_number"] for entry in (first, second)] == [
+        ACCOUNT_NUMBER,
+        OTHER_ACCOUNT_NUMBER,
+    ]
 
 
 async def test_duplicate_account_rejected(
@@ -364,7 +415,7 @@ async def test_reauth_with_credentials_recovers_entry(
     result = await hass.config_entries.flow.async_configure(
         result["flow_id"], FLOW_INPUT
     )
-    await hass.async_block_till_done()
+    await hass.async_block_till_done(wait_background_tasks=True)
     assert result["type"] == FlowResultType.ABORT
     assert result["reason"] == "reauth_successful"
     assert entry.data[CONF_PASSWORD] == PASSWORD
@@ -387,7 +438,7 @@ async def test_session_expiry_relogin_recovers(
     before = float(hass.states.get(water_id).state)
 
     # Drop the portal session: the next refresh must fail, re-login, retry.
-    portal.app["state"]["logged_in"] = False
+    expire_sessions(portal)
     await entry.runtime_data.async_refresh()
     await hass.async_block_till_done()
 
@@ -438,7 +489,7 @@ async def test_recent_hourly_followup_imports_new_days(
     entry = await _setup_entry(hass, portal, monctonwater_urls)
     await hass.async_block_till_done(wait_background_tasks=True)
     coordinator = entry.runtime_data
-    yesterday = date.today() - timedelta(days=1)
+    yesterday = mock_today() - timedelta(days=1)
     assert coordinator.stored_hourly_through() == yesterday
 
     # Simulate the portal publishing a new day after the backfill
@@ -451,6 +502,247 @@ async def test_recent_hourly_followup_imports_new_days(
     await hass.async_block_till_done(wait_background_tasks=True)
 
     assert coordinator.stored_hourly_through() == yesterday
+
+
+async def _day_change(hass: HomeAssistant, entry: MockConfigEntry, day: date) -> float:
+    """The day's rendered consumption: its last sum minus the prior row's."""
+    from homeassistant.components.recorder import get_instance
+    from homeassistant.components.recorder.statistics import statistics_during_period
+
+    await get_instance(hass).async_block_till_done()
+    statistic_id = _entity_id(hass, entry, WATER_KEY)
+    start = dt_util.start_of_local_day(day)
+    stats = await get_instance(hass).async_add_executor_job(
+        statistics_during_period,
+        hass,
+        start - timedelta(hours=1),
+        start + timedelta(days=1),
+        {statistic_id},
+        "hour",
+        None,
+        {"sum"},
+    )
+    rows = sorted(stats[statistic_id], key=lambda r: r["start"])
+    return rows[-1]["sum"] - rows[0]["sum"]
+
+
+async def test_recent_hourly_reimports_revised_day(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """The portal publishes yesterday progressively (live: 0.582 m³ at
+    02:00, revised to 0.659 m³ by 06:00). A revised daily total must
+    re-import the trailing window even though the day was imported."""
+    entry = await _setup_entry(hass, portal, monctonwater_urls)
+    await hass.async_block_till_done(wait_background_tasks=True)
+    coordinator = entry.runtime_data
+    yesterday = mock_today() - timedelta(days=1)
+
+    # Yesterday first appears with only its first 12 hours published.
+    portal.app["state"]["published_hours"] = {yesterday: 12}
+    await coordinator.store_hourly_progress(
+        yesterday - timedelta(days=1), coordinator.stored_hourly_seed()
+    )
+    await coordinator.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert coordinator.stored_hourly_through() == yesterday
+    assert await _day_change(hass, entry, yesterday) == pytest.approx(
+        sum(hourly_values(yesterday)[:12]), abs=0.005
+    )
+
+    # The rest of the day publishes: same last day, revised total.
+    portal.app["state"]["published_hours"] = {}
+    await coordinator.async_refresh()
+    await hass.async_block_till_done(wait_background_tasks=True)
+    assert await _day_change(hass, entry, yesterday) == pytest.approx(
+        daily_value(yesterday), abs=0.005
+    )
+
+
+async def test_billed_table_read_once_a_day(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+    monkeypatch,
+):
+    """The billed table changes quarterly: refreshes reuse the stored
+    history and re-read the page once a day."""
+    from custom_components.monctonwater import coordinator as mw_coordinator
+
+    monkeypatch.setattr(mw_coordinator, "BILLED_REFRESH_INTERVAL", timedelta(hours=24))
+    entry = await _setup_entry(hass, portal, monctonwater_urls, backfill_daily=False)
+    coordinator = entry.runtime_data
+    water_id = _entity_id(hass, entry, WATER_KEY)
+    before = hass.states.get(water_id).state
+    calls = portal.app["billed_calls"]
+    assert len(calls) == 1
+
+    await coordinator.async_refresh()
+    assert coordinator.last_update_success
+    assert len(calls) == 1
+    assert hass.states.get(water_id).state == before
+
+    # A day on, the page is read again.
+    coordinator._billed_checked -= timedelta(hours=24)  # noqa: SLF001
+    await coordinator.async_refresh()
+    assert len(calls) == 2
+
+
+async def test_account_without_smart_meter_data_sets_up(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """No smart-meter data (billed-only account, or the meter backend is
+    down) is not an auth failure: setup succeeds on the billed books and
+    no re-auth flow starts."""
+    portal.app["state"]["smart_meter_empty"] = True
+    entry = await _setup_entry(hass, portal, monctonwater_urls, backfill_daily=False)
+
+    assert entry.state is ConfigEntryState.LOADED
+    assert not hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    water = hass.states.get(_entity_id(hass, entry, WATER_KEY))
+    assert float(water.state) == pytest.approx(sum(m3 for _, m3 in billed_readings()))
+
+
+async def test_stale_smart_meter_page_does_not_trigger_reauth(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """Empty smart-meter arrays that survive a fresh login must not stop
+    polling behind a re-auth prompt: the refresh succeeds on the billed
+    books and the counter holds."""
+    entry = await _setup_entry(hass, portal, monctonwater_urls, backfill_daily=False)
+    coordinator = entry.runtime_data
+    water_id = _entity_id(hass, entry, WATER_KEY)
+    before = float(hass.states.get(water_id).state)
+
+    portal.app["state"]["smart_meter_empty"] = True
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    assert coordinator.last_update_success
+    assert not hass.config_entries.flow.async_progress_by_handler(DOMAIN)
+    assert float(hass.states.get(water_id).state) == before
+
+
+async def test_reauth_with_another_accounts_credentials_aborts(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """Re-auth must stay on the entry's account; another account's
+    credentials would graft its usage onto this entry's statistics."""
+    entry = await _setup_entry(hass, portal, monctonwater_urls, backfill_daily=False)
+    result = await entry.start_reauth_flow(hass)
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {CONF_USERNAME: "otheruser", CONF_PASSWORD: VALID_CREDS["otheruser"]},
+    )
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "wrong_account"
+    assert entry.data[CONF_USERNAME] == USERNAME
+
+
+async def test_redated_billed_read_is_not_double_counted(
+    recorder_mock,
+    hass,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+    monkeypatch,
+):
+    """A read the portal re-dates (an estimate replaced by an actual read)
+    replaces the stored period instead of sitting beside it."""
+    import conftest as cf
+
+    entry = await _setup_entry(hass, portal, monctonwater_urls, backfill_daily=False)
+    coordinator = entry.runtime_data
+    water_id = _entity_id(hass, entry, WATER_KEY)
+    before = float(hass.states.get(water_id).state)
+
+    billed = billed_readings()  # newest first
+    newest_date, newest_m3 = billed[0]
+    redated = [(newest_date + timedelta(days=2), newest_m3), *billed[1:]]
+    original = cf.consumption_page
+    monkeypatch.setattr(cf, "consumption_page", lambda state: original(state, redated))
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+
+    history = coordinator.merged_billed([])
+    assert newest_date not in [r.read_date for r in history]
+    assert sum(r.consumption_m3 for r in history) == pytest.approx(
+        sum(m3 for _, m3 in billed)
+    )
+    # The counter holds (two days moved into the bill) rather than jumping
+    # by a whole duplicated quarter.
+    assert float(hass.states.get(water_id).state) == pytest.approx(before)
+
+
+async def test_stats_generation_reset_keeps_billed_history(
+    recorder_mock,
+    hass,
+    hass_storage,
+    portal,
+    monctonwater_urls,
+    patched_helper_session,
+    enable_custom_integrations,
+):
+    """A statistics-convention reset re-imports the statistics but must
+    keep the billed quarters the portal's rolling window has dropped —
+    they cannot be fetched again."""
+    from custom_components.monctonwater.const import (
+        STATS_GEN,
+        STORAGE_KEY,
+        STORAGE_VERSION,
+    )
+
+    monctonwater_urls(server_base(portal))
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title=ACCOUNT_TITLE,
+        data=FLOW_INPUT,
+        options={"backfill_daily": False},
+        unique_id=f"account_{ACCOUNT_NUMBER}",
+    )
+    entry.add_to_hass(hass)
+    rolled_off = billed_readings()[-1][0] - timedelta(days=91)
+    hass_storage[f"{STORAGE_KEY}.{entry.entry_id}"] = {
+        "version": STORAGE_VERSION,
+        "minor_version": 1,
+        "key": f"{STORAGE_KEY}.{entry.entry_id}",
+        "data": {
+            "stats_gen": STATS_GEN - 1,
+            "stats_imported": True,
+            "last_cumulative_m3": 1.0,
+            "billed_history": [[rolled_off.isoformat(), 55.0]],
+        },
+    }
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+
+    history = entry.runtime_data.merged_billed([])
+    assert rolled_off in [r.read_date for r in history]
+
+
 async def test_rolling_billed_window_preserves_history(
     recorder_mock,
     hass,

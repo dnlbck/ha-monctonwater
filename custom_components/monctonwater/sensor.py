@@ -91,6 +91,9 @@ class MonctonWaterSensorEntity(
     """A sensor backed by the Moncton Water coordinator."""
 
     _attr_has_entity_name = True
+    # The ~100-day window changes daily; recording it would store a fresh
+    # copy in the database every day for no history value.
+    _unrecorded_attributes = frozenset({"daily_m3"})
 
     def __init__(
         self,

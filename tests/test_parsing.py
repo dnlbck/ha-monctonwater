@@ -57,6 +57,30 @@ def test_parse_daily_readings_empty_page():
     assert parse_daily_readings("<html><body>no data</body></html>") == []
 
 
+def test_parse_daily_readings_keeps_alignment_across_gaps():
+    """A non-numeric entry drops only its own day, never shifts later ones."""
+    html = (
+        'var aTouDate = ["2026-09-01","2026-09-02","2026-09-03"];\n'
+        'series: [{ type: "column", name: "Usage", data: [0.5,null,0.7,] }]'
+    )
+    readings = parse_daily_readings(html)
+    assert [(r.day, r.consumption_m3) for r in readings] == [
+        (date(2026, 9, 1), 0.5),
+        (date(2026, 9, 3), 0.7),
+    ]
+
+
+def test_parse_hourly_values_keeps_hour_positions():
+    """A gap reads as 0 for its hour; later hours keep their slots."""
+    data = ",".join(["0.01"] * 5 + ["null"] + ["0.02"] * 18)
+    html = f'series: [{{ type: "column", name: "Usage", data: [{data}] }}]'
+    values = parse_hourly_values(html)
+    assert len(values) == 24
+    assert values[5] == 0.0
+    assert values[6] == pytest.approx(0.02)
+    assert parse_hourly_values('name: "Usage", data: [null,null]') == []
+
+
 def test_parse_hourly_values_real_capture():
     html = (FIXTURES / "smart_meter_arrays.html").read_text(encoding="utf-8")
     # The fixture holds the daily variant: one value per date.
@@ -98,6 +122,22 @@ def test_build_ssl_context_loads_bundled_intermediate():
     stats = context.cert_store_stats()
     # The intermediate adds at least one cert on top of the default store.
     assert stats["x509_ca"] >= 1
+
+
+def test_bundled_intermediate_is_not_about_to_expire():
+    """Fail well before the bundled intermediate lapses (see api.py)."""
+    from datetime import datetime, timezone
+
+    from cryptography import x509
+
+    from custom_components.monctonwater.api import _CERTS_DIR, _EXTRA_CA_BUNDLES
+
+    for name in _EXTRA_CA_BUNDLES:
+        cert = x509.load_pem_x509_certificate((_CERTS_DIR / name).read_bytes())
+        expires = cert.not_valid_after_utc
+        assert expires - datetime.now(timezone.utc) > timedelta(days=90), (
+            f"{name} expires {expires:%Y-%m-%d}; bundle the portal's current issuer"
+        )
 
 
 def test_parse_hourly_csv():

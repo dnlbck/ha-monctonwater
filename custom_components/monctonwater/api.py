@@ -33,6 +33,7 @@ driven standalone by ``scripts/test_client.py``.
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import logging
@@ -40,12 +41,17 @@ import re
 import ssl
 import urllib.parse
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import aiohttp
 
-from .exceptions import MonctonWaterApiError, MonctonWaterAuthError
+from .exceptions import (
+    MonctonWaterApiError,
+    MonctonWaterAuthError,
+    MonctonWaterSessionError,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -66,6 +72,12 @@ _LOGIN_FORM_MARKER = 'id="login-form"'
 # does not, so verification fails with "unable to get local issuer
 # certificate". The intermediate is bundled and added on top of the
 # default CA store — full verification, nothing disabled.
+#
+# Shelf life: the bundled intermediate is valid to 2027-12-10, but the
+# portal's leaf (checked 2026-10-06) expires 2027-04-11 and its renewal
+# may come from a different intermediate. When verification starts
+# failing, bundle the new leaf's issuer — its URL is in the leaf's AIA
+# "CA Issuers" field (now http://crt.sectigo.com/EntrustOVTLSIssuingRSACA2.crt).
 _CERTS_DIR = Path(__file__).parent / "certs"
 _EXTRA_CA_BUNDLES = ("entrust_ov_tls_issuing_rsa_ca_2.pem",)
 
@@ -76,6 +88,25 @@ def build_ssl_context() -> ssl.SSLContext:
     for name in _EXTRA_CA_BUNDLES:
         context.load_verify_locations(cafile=str(_CERTS_DIR / name))
     return context
+
+
+try:
+    _PORTAL_TZ: ZoneInfo | None = ZoneInfo("America/Moncton")
+except ZoneInfoNotFoundError:  # Windows without tzdata (standalone scripts)
+    _PORTAL_TZ = None
+
+
+def portal_today() -> date:
+    """Today on the portal's (Atlantic) calendar.
+
+    The to-date clamps below must use the portal's notion of today, not
+    the process clock's: a container running on UTC is already
+    "tomorrow" every evening, which turns yesterday into the portal's
+    today — and the portal answers that with its default window.
+    """
+    return datetime.now(_PORTAL_TZ).date() if _PORTAL_TZ else date.today()
+
+
 _CSRF_RE = re.compile(r'name="jspCSRFToken"\s+value="([^"]+)"')
 _ACCOUNT_WATCHING_RE = re.compile(
     r"watching the account:(?:\s|<[^>]+>)*([\d-]+)"
@@ -196,11 +227,7 @@ def parse_daily_readings(html: str) -> list[DailyReading]:
     if dates_match is None or data_match is None:
         return []
     days = re.findall(r"\d{4}-\d{2}-\d{2}", dates_match.group(1))
-    values = [
-        v
-        for v in (_to_float(item) for item in data_match.group(1).split(","))
-        if v is not None
-    ]
+    values = _parse_number_array(data_match.group(1))
     if len(days) != len(values):
         _LOGGER.warning(
             "Smart meter page arrays disagree (%s dates, %s values); "
@@ -208,22 +235,36 @@ def parse_daily_readings(html: str) -> list[DailyReading]:
             len(days),
             len(values),
         )
+    # Pair first, then drop gaps: filtering first would shift every value
+    # after a gap onto the previous day.
     return [
         DailyReading(day=date.fromisoformat(day), consumption_m3=value)
         for day, value in zip(days, values, strict=False)
+        if value is not None
     ]
 
 
 def parse_hourly_values(html: str) -> list[float]:
-    """Parse the smartMeterConsum hourly page into 24 hour-beginning values."""
+    """Parse the smartMeterConsum hourly page into 24 hour-beginning values.
+
+    A gap reads as 0 for its hour so later hours keep their positions; a
+    page with no numbers at all (not published yet) yields no values.
+    """
     data_match = _USAGE_SERIES_DATA_RE.search(html)
     if data_match is None:
         return []
-    return [
-        v
-        for v in (_to_float(item) for item in data_match.group(1).split(","))
-        if v is not None
-    ]
+    values = _parse_number_array(data_match.group(1))
+    if all(v is None for v in values):
+        return []
+    return [0.0 if v is None else v for v in values]
+
+
+def _parse_number_array(body: str) -> list[float | None]:
+    """Parse a JavaScript array body positionally (None for non-numbers)."""
+    items = body.split(",")
+    if items and not items[-1].strip():
+        items.pop()  # empty array, or a trailing comma
+    return [_to_float(item) for item in items]
 
 
 def _to_float(value: str) -> float | None:
@@ -257,8 +298,21 @@ def parse_hourly_csv(text: str) -> list[HourlyReading]:
     return readings
 
 
+def _smart_meter_params(date_from: date, date_to: date) -> dict[str, str]:
+    return {
+        "para": "smartMeterConsum",
+        "inquiryType": "water",
+        "fromDate": date_from.isoformat(),
+        "toDate": date_to.isoformat(),
+    }
+
+
 class MonctonWaterClient:
-    """Client for the Moncton MyAccount portal."""
+    """Client for the Moncton MyAccount portal.
+
+    The portal session is a cookie, so the client needs a ClientSession
+    (cookie jar) of its own: a re-login clears the jar.
+    """
 
     def __init__(
         self,
@@ -279,6 +333,11 @@ class MonctonWaterClient:
         self._ssl_context = ssl_context if ssl_context is not None else (
             build_ssl_context() if self._base.startswith("https") else None
         )
+        # The portal keeps per-session query state (the CSV export serves
+        # the last queried range), so request sequences on this session —
+        # coordinator refreshes, the backfill walk, the hourly followup —
+        # must not interleave.
+        self._lock = asyncio.Lock()
 
     @property
     def logged_in(self) -> bool:
@@ -299,38 +358,43 @@ class MonctonWaterClient:
     # ------------------------------------------------------------------
 
     async def bootstrap(self, username: str, password: str) -> AccountInfo:
-        """Log in and resolve the active account."""
+        """Sign in afresh and resolve the active account."""
         self.set_credentials(username, password)
         self.invalidate()
-        await self._login(username, password)
-        self.account = await self.get_account_info()
-        return self.account
+        async with self._lock:
+            # Start from an empty jar: a JSESSIONID that is stale, or
+            # signed in with other credentials, must never stand in for
+            # this login.
+            self._session.cookie_jar.clear()
+            await self._login(username, password)
+            account = await self._fetch_account_info()
+        self.account = account
+        return account
 
     async def ensure_session(self) -> None:
-        """Re-login when the portal session has lapsed."""
+        """Sign in again if the session was invalidated (or expired)."""
         if not self.logged_in:
             if not (self._username and self._password):
                 raise MonctonWaterAuthError("Client has no credentials")
-            await self._login(self._username, self._password)
+            await self.bootstrap(self._username, self._password)
 
     async def get_account_info(self) -> AccountInfo:
         """Fetch the active account from the account-selection page."""
-        html = await self._get_page(
-            "/app/capricorn", {"para": "selectAccount"}
-        )
-        return parse_account_info(html)
+        async with self._lock:
+            return await self._fetch_account_info()
 
     async def get_billed_readings(self) -> list[BilledReading]:
         """Fetch billed consumption per billing period (~quarterly, m³)."""
-        html = await self._get_page(
-            "/app/capricorn",
-            {
-                "para": "consumptionInquiry",
-                "inquiryType": "water",
-                "report": "WATCONRP",
-                "tab": "WATERCON",
-            },
-        )
+        async with self._lock:
+            html = await self._get_page(
+                "/app/capricorn",
+                {
+                    "para": "consumptionInquiry",
+                    "inquiryType": "water",
+                    "report": "WATCONRP",
+                    "tab": "WATERCON",
+                },
+            )
         return parse_billed_readings(html)
 
     async def get_daily_readings(
@@ -342,31 +406,27 @@ class MonctonWaterClient:
         portal ignore the requested range and return its default 30-day
         window instead.
         """
-        date_to = min(date_to, date.today() - timedelta(days=1))
+        date_to = min(date_to, portal_today() - timedelta(days=1))
         if date_to < date_from:
             return []
-        html = await self._get_page(
-            "/app/capricorn",
-            {
-                "para": "smartMeterConsum",
-                "inquiryType": "water",
-                "fromDate": date_from.isoformat(),
-                "toDate": date_to.isoformat(),
-            },
-        )
+        async with self._lock:
+            html = await self._get_page(
+                "/app/capricorn", _smart_meter_params(date_from, date_to)
+            )
         return parse_daily_readings(html)
 
     async def get_hourly_values(self, day: date) -> list[float]:
         """Fetch one day's hourly usage (24 hour-beginning values, m³)."""
-        html = await self._get_page(
-            "/app/capricorn",
-            {
-                "para": "smartMeterConsum",
-                "type": "hourly",
-                "day": day.isoformat(),
-                "inquiryType": "water",
-            },
-        )
+        async with self._lock:
+            html = await self._get_page(
+                "/app/capricorn",
+                {
+                    "para": "smartMeterConsum",
+                    "type": "hourly",
+                    "day": day.isoformat(),
+                    "inquiryType": "water",
+                },
+            )
         return parse_hourly_values(html)
 
     async def get_hourly_csv(self, date_from: date, date_to: date) -> list[HourlyReading]:
@@ -377,50 +437,61 @@ class MonctonWaterClient:
         window (which also renders the daily arrays), ask for a download
         key, then download the CSV from ``/app/ExcelExport``. One page
         render plus two small requests per window; windows beyond ~90
-        days time out server-side.
+        days time out server-side. Rows outside the window are dropped,
+        and a CSV for some other range raises rather than reading as "no
+        data" (which the backfill takes for the start of the meter era).
         """
-        date_to = min(date_to, date.today() - timedelta(days=1))
+        date_to = min(date_to, portal_today() - timedelta(days=1))
         if date_to < date_from:
             return []
-        await self._get_page(
-            "/app/capricorn",
-            {
-                "para": "smartMeterConsum",
-                "inquiryType": "water",
-                "fromDate": date_from.isoformat(),
-                "toDate": date_to.isoformat(),
-            },
-        )
-        key = (
+        async with self._lock:
             await self._get_page(
-                "/app/capricorn",
-                {
-                    "para": "ajaxDownloadConsumptionData",
-                    "type": "smartmeter",
-                    "inquiryType": "water",
-                },
+                "/app/capricorn", _smart_meter_params(date_from, date_to)
             )
-        ).strip()
-        if not key:
-            raise MonctonWaterApiError("Portal returned an empty CSV download key")
-        # The key arrives percent-encoded and the server decodes it once;
-        # re-encoding the raw form reproduces the browser's URL exactly
-        # (verified against the live portal).
-        quoted = urllib.parse.quote(key, safe="")
-        text = await self._request("GET", f"/app/ExcelExport?key={quoted}")
-        return parse_hourly_csv(text)
+            key = (
+                await self._get_page(
+                    "/app/capricorn",
+                    {
+                        "para": "ajaxDownloadConsumptionData",
+                        "type": "smartmeter",
+                        "inquiryType": "water",
+                    },
+                )
+            ).strip()
+            if not key:
+                raise MonctonWaterApiError("Portal returned an empty CSV download key")
+            # The key arrives percent-encoded and the server decodes it once;
+            # re-encoding the raw form reproduces the browser's URL exactly
+            # (verified against the live portal).
+            quoted = urllib.parse.quote(key, safe="")
+            text = await self._request("GET", f"/app/ExcelExport?key={quoted}")
+        if is_login_page(text):
+            self.invalidate()
+            raise MonctonWaterSessionError("Portal session expired during the CSV export")
+        readings = parse_hourly_csv(text)
+        in_window = [r for r in readings if date_from <= r.day <= date_to]
+        if readings and not in_window:
+            raise MonctonWaterApiError(
+                f"CSV export served {readings[0].day}..{readings[-1].day}, "
+                f"not the requested {date_from}..{date_to}"
+            )
+        return in_window
 
     # ------------------------------------------------------------------
     # Portal plumbing
     # ------------------------------------------------------------------
 
+    async def _fetch_account_info(self) -> AccountInfo:
+        html = await self._get_page("/app/capricorn", {"para": "selectAccount"})
+        return parse_account_info(html)
+
     async def _login(self, username: str, password: str) -> None:
         """Submit the login form; a failed login re-renders the same page.
 
-        An already-authenticated session (cookies survive from a prior
-        login on the shared session, e.g. the config flow's validation)
-        gets the meta-refresh redirect page instead of the login form —
-        in that case there is nothing to do.
+        bootstrap empties the cookie jar first, so the form is expected.
+        Should the portal still answer with its meta-refresh redirect page
+        (an authenticated session), there is nothing to submit; the
+        account-page fetch that follows confirms the session either way.
         """
         login_html = await self._request(
             "GET",
@@ -456,7 +527,9 @@ class MonctonWaterClient:
         """GET a portal page; raise when the session has expired."""
         html = await self._request("GET", path, params=params)
         if is_login_page(html):
-            raise MonctonWaterAuthError("Portal session expired")
+            # Mark it so ensure_session (and the coordinator) sign in again.
+            self.invalidate()
+            raise MonctonWaterSessionError("Portal session expired")
         return html
 
     async def _request(
@@ -474,19 +547,28 @@ class MonctonWaterClient:
             "Accept-Language": "en-CA,en;q=0.9",
             "Referer": f"{self._base}/app/capricorn?para=index",
         }
-        async with self._session.request(
-            method,
-            url,
-            params=params,
-            data=data,
-            headers=headers,
-            timeout=_REQUEST_TIMEOUT,
-            allow_redirects=True,
-            ssl=self._ssl_context,
-        ) as resp:
-            text = await resp.text()
-            if resp.status != 200:
-                raise MonctonWaterApiError(
-                    f"{method} {path} returned HTTP {resp.status}: {text[:200]}"
-                )
-            return text
+        try:
+            async with self._session.request(
+                method,
+                url,
+                params=params,
+                data=data,
+                headers=headers,
+                timeout=_REQUEST_TIMEOUT,
+                allow_redirects=True,
+                ssl=self._ssl_context,
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    raise MonctonWaterApiError(
+                        f"{method} {path} returned HTTP {resp.status}: {text[:200]}"
+                    )
+                return text
+        except aiohttp.ClientConnectorCertificateError as err:
+            # Most likely the portal's chain changed under the bundled
+            # intermediate (see _EXTRA_CA_BUNDLES); say so in the log.
+            raise MonctonWaterApiError(
+                "TLS verification of the portal failed; its certificate chain "
+                "may have changed, and the intermediate bundled in certs/ needs "
+                f"updating: {err.certificate_error}"
+            ) from err

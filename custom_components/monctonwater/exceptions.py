@@ -8,7 +8,15 @@ class MonctonWaterError(Exception):
 
 
 class MonctonWaterAuthError(MonctonWaterError):
-    """Raised when logging in to the portal fails or the session expires."""
+    """Raised when the portal rejects the credentials."""
+
+
+class MonctonWaterSessionError(MonctonWaterError):
+    """Raised when the portal session has expired or gone stale.
+
+    Distinct from MonctonWaterAuthError: a fresh login fixes it, so it
+    must never surface as a re-authentication request.
+    """
 
 
 class MonctonWaterApiError(MonctonWaterError):

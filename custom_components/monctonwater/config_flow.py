@@ -15,7 +15,7 @@ from homeassistant.config_entries import (
 )
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.aiohttp_client import async_create_clientsession
 from homeassistant.helpers.selector import (
     NumberSelector,
     NumberSelectorConfig,
@@ -48,12 +48,12 @@ async def _validate_login(hass: HomeAssistant, username: str, password: str) -> 
     Runs the full bootstrap: form login and an account-page fetch.
     Raises ValueError("invalid_auth"|"cannot_connect") on failure.
     """
-    client = MonctonWaterClient(
-        async_get_clientsession(hass),
-        base_url=BASE_URL,
-        # CA-bundle loading touches the filesystem; keep it off the loop.
-        ssl_context=await hass.async_add_executor_job(build_ssl_context),
-    )
+    # CA-bundle loading touches the filesystem; keep it off the loop.
+    ssl_context = await hass.async_add_executor_job(build_ssl_context)
+    # A throwaway cookie jar: validation must never sign in on (or
+    # replace) a session a configured entry is using.
+    session = async_create_clientsession(hass, auto_cleanup=False)
+    client = MonctonWaterClient(session, base_url=BASE_URL, ssl_context=ssl_context)
     try:
         account = await client.bootstrap(username, password)
     except MonctonWaterAuthError as err:
@@ -68,6 +68,8 @@ async def _validate_login(hass: HomeAssistant, username: str, password: str) -> 
             exc_info=err,
         )
         raise ValueError("cannot_connect") from err
+    finally:
+        session.detach()  # leaves HA's shared connector open
     return account.account_number
 
 
@@ -117,14 +119,18 @@ class MonctonWaterConfigFlow(ConfigFlow, domain=DOMAIN):
         existing_entry = self._get_reauth_entry()
         if user_input is not None:
             try:
-                await _validate_login(
+                account_number = await _validate_login(
                     self.hass,
                     user_input[CONF_USERNAME],
                     user_input[CONF_PASSWORD],
                 )
             except ValueError as err:
                 errors["base"] = str(err.args[0])
-            if not errors:
+            else:
+                # Another account's credentials would graft its usage
+                # onto this entry's counter and statistics.
+                await self.async_set_unique_id(f"account_{account_number}")
+                self._abort_if_unique_id_mismatch(reason="wrong_account")
                 return self.async_update_reload_and_abort(
                     existing_entry, data=user_input
                 )

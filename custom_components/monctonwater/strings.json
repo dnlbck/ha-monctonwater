@@ -21,7 +21,9 @@
       "invalid_auth": "Invalid credentials. Check your username and password and try again."
     },
     "abort": {
-      "already_configured": "This Moncton Water account is already configured."
+      "already_configured": "This Moncton Water account is already configured.",
+      "reauth_successful": "Re-authentication was successful.",
+      "wrong_account": "These credentials sign in to a different Moncton account than this entry's."
     }
   },
   "options": {

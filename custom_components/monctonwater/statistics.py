@@ -32,22 +32,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Awaitable, Callable
 from datetime import date, datetime, timedelta
 
 import aiohttp
+from homeassistant.components.recorder import get_instance
 from homeassistant.components.recorder.models import (
     StatisticData,
     StatisticMeanType,
     StatisticMetaData,
 )
-from homeassistant.components.recorder.statistics import async_import_statistics
+from homeassistant.components.recorder.statistics import (
+    async_import_statistics,
+    statistics_during_period,
+)
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import UnitOfVolume
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import entity_registry as er
 from homeassistant.util import dt as dt_util
 
-from .api import BilledReading, DailyReading, HourlyReading
+from .api import BilledReading, DailyReading, HourlyReading, MonctonWaterClient
 from .const import (
     BACKFILL_MAX_DAYS,
     BACKFILL_REQUEST_PAUSE,
@@ -55,8 +60,8 @@ from .const import (
     QUERY_WINDOW_DAYS,
     REIMPORT_DAYS,
 )
-from .coordinator import MonctonWaterCoordinator
-from .exceptions import MonctonWaterError
+from .coordinator import ATTR_DAILY_M3, MonctonWaterCoordinator
+from .exceptions import MonctonWaterError, MonctonWaterSessionError
 from .sensor import UNIQUE_ID_TEMPLATE, WATER_KEY
 
 _LOGGER = logging.getLogger(__name__)
@@ -196,10 +201,26 @@ def _water_statistic_id(hass: HomeAssistant, entry: ConfigEntry) -> str | None:
     )
 
 
-async def _fetch_billed(coordinator: MonctonWaterCoordinator) -> list[BilledReading]:
-    if coordinator.history_billed:
-        return coordinator.history_billed
-    return coordinator.merged_billed(await coordinator.client.get_billed_readings())
+def _billed(coordinator: MonctonWaterCoordinator) -> list[BilledReading]:
+    # Every refresh — including the one that ran before any backfill —
+    # merges the portal's table into the persisted history, so there is
+    # no need to render the page again.
+    return coordinator.history_billed or coordinator.billed_history()
+
+
+async def _portal_call[_T](
+    client: MonctonWaterClient, call: Callable[[], Awaitable[_T]]
+) -> _T:
+    """Run a portal call, signing in again once if the session lapsed.
+
+    The backfill walk easily outlives the portal's short sessions.
+    """
+    try:
+        return await call()
+    except MonctonWaterSessionError:
+        client.invalidate()
+        await client.ensure_session()
+        return await call()
 
 
 async def async_import_history_statistics(
@@ -272,19 +293,23 @@ async def async_backfill_hourly_statistics(
     client = coordinator.client
     today = dt_util.now().date()
 
-    billed = await _fetch_billed(coordinator)
+    billed = _billed(coordinator)
     earliest_billed = billed[0].read_date if billed else today - timedelta(
         days=BACKFILL_MAX_DAYS
     )
 
-    readings: list[HourlyReading] = []
+    # Keyed by day: a day the walk sees twice must not be counted twice.
+    by_day: dict[date, HourlyReading] = {}
     floor = min(earliest_billed, today - timedelta(days=BACKFILL_MAX_DAYS))
     for window_from, window_to in _walk_windows(today, floor):
         try:
-            batch = await client.get_hourly_csv(window_from, window_to)
+            batch = await _portal_call(
+                client,
+                lambda: client.get_hourly_csv(window_from, window_to),  # noqa: B023
+            )
         except (MonctonWaterError, TimeoutError, OSError, aiohttp.ClientError) as err:
             _LOGGER.warning(
-                "Hourly backfill stopped at %s (%s); it will retry on restart",
+                "Hourly backfill stopped at %s (%r); it will retry on restart",
                 window_to,
                 err,
             )
@@ -292,11 +317,11 @@ async def async_backfill_hourly_statistics(
         if not batch:
             _LOGGER.debug("Hourly backfill reached the start of data at %s", window_from)
             break
-        readings.extend(batch)
+        by_day.update((reading.day, reading) for reading in batch)
         await asyncio.sleep(BACKFILL_REQUEST_PAUSE)
 
+    readings = [by_day[day] for day in sorted(by_day)]
     if readings:
-        readings.sort(key=lambda r: r.day)
         era_start = readings[0].day
 
         # Era hourly rows end at exactly 0 by construction: the chain
@@ -350,11 +375,9 @@ async def _last_sum_before(
     hass: HomeAssistant, statistic_id: str, before: datetime
 ) -> float | None:
     """Return the cumulative sum of the last statistic row before ``before``."""
-    from homeassistant.components.recorder.statistics import (
-        statistics_during_period,
-    )
-
-    stats = await hass.async_add_executor_job(
+    # The recorder's own executor: database access from HA's generic one
+    # is slower and logs a "without the database executor" warning.
+    stats = await get_instance(hass).async_add_executor_job(
         statistics_during_period,
         hass,
         before - timedelta(days=2),
@@ -392,13 +415,24 @@ async def async_import_recent_hourly(
     through = coordinator.stored_hourly_through()
     if last_daily is None or through is None:
         return
-    if last_daily <= through:
-        return  # nothing new since the last hourly import
 
     # Re-import the trailing window, not just the new day: the
     # recorder's native rows book each day's usage as one lump when it
-    # publishes, and compaction can rewrite recent hours.
+    # publishes, and compaction can rewrite recent hours. The portal
+    # also publishes yesterday progressively (live: 0.582 m³ at 02:00,
+    # revised to 0.659 m³ by 06:00), so a revised daily total in the
+    # window re-imports it too.
     start_day = last_daily - timedelta(days=REIMPORT_DAYS)
+    daily: dict[str, float] = data.get(ATTR_DAILY_M3) or {}
+    totals = {
+        key: daily.get(key)
+        for key in (
+            (start_day + timedelta(days=i)).isoformat()
+            for i in range(REIMPORT_DAYS + 1)
+        )
+    }
+    if last_daily <= through and totals == coordinator.stored_hourly_totals():
+        return  # nothing new or revised since the last hourly import
     seed = await _last_sum_before(
         hass, statistic_id, dt_util.start_of_local_day(start_day)
     )
@@ -410,9 +444,12 @@ async def async_import_recent_hourly(
     day = start_day
     while day <= last_daily:
         try:
-            values = await client.get_hourly_values(day)
+            values = await _portal_call(
+                client,
+                lambda: client.get_hourly_values(day),  # noqa: B023
+            )
         except (MonctonWaterError, TimeoutError, OSError, aiohttp.ClientError) as err:
-            _LOGGER.warning("Recent hourly import stopped at %s (%s)", day, err)
+            _LOGGER.warning("Recent hourly import stopped at %s (%r)", day, err)
             break
         if not values:
             break  # not published yet; a later refresh picks it up
@@ -421,7 +458,14 @@ async def async_import_recent_hourly(
         day += timedelta(days=1)
     if rows:
         async_import_statistics(hass, _metadata(statistic_id), rows)
-        await coordinator.store_hourly_progress(day - timedelta(days=1), seed)
+        imported_through = day - timedelta(days=1)
+        # Remember the totals only for a complete window; otherwise the
+        # next refresh tries again.
+        await coordinator.store_hourly_progress(
+            imported_through,
+            seed,
+            totals if imported_through == last_daily else None,
+        )
         _LOGGER.info(
             "Imported %s recent hourly rows (%s to %s), through advanced to %s",
             len(rows),
